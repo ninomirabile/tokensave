@@ -76,15 +76,29 @@ fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
     properties.insert(
         "graph_root".to_string(),
         json!({
-            "type": "string",
-            "description": "Exact absolute initialized project root to query."
+            // `anyOf` rather than `"type": ["string", "array"]` (#440): JSON
+            // Schema permits a union in `type`, but Gemini's
+            // function-declaration proto validates `items` against a single
+            // `Type.ARRAY` and rejects the whole request — every tool in it,
+            // not just this one. `anyOf` says the same thing and passes.
+            "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+            ],
+            "description": "Exact absolute initialized project root to query. Omit to query \
+             the project this server already serves; when present it must name a different \
+             project. `tokensave_search` and `tokensave_files` also accept an array of roots \
+             and answer across all of them at once, interleaving results by rank; roots that \
+             are worktrees of a repository already named are collapsed, and the response says \
+             which. Every other tool answers about a single graph and rejects an array."
         }),
     );
     properties.insert(
         "graph_branch".to_string(),
         json!({
             "type": "string",
-            "description": "Exact tracked branch to query within graph_root."
+            "description": "Exact tracked branch to query within graph_root. Requires \
+             graph_root."
         }),
     );
 
@@ -126,7 +140,11 @@ pub fn is_graph_scoped_tool(definition: &ToolDefinition) -> bool {
 /// and costing far more than the calls it discouraged. Keep this a `const`;
 /// never derive any part of it from graph state.
 pub const CONTEXT_DESCRIPTION: &str = "Build an AI-ready context for a task description. \
-     Returns relevant symbols, relationships, and optionally code snippets.";
+     Returns relevant symbols, relationships, and optionally code snippets. \
+     The output includes a `### Retrieval` section: when it lists zero-hit terms, \
+     re-query once with `keywords` synonyms for them (or use tokensave_search); \
+     a `match: fts-only` tier means weak lexical matches, so verify entry points \
+     before building on them.";
 
 /// Returns the list of all tool definitions exposed by this MCP server.
 ///
@@ -146,9 +164,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         graph_scoped(def_files()),
         def_affected(),
         graph_scoped(def_dead_code()),
+        graph_scoped(def_ambiguous_calls()),
         def_diff_context(),
         graph_scoped(def_module_api()),
         graph_scoped(def_circular()),
+        graph_scoped(def_imports()),
         graph_scoped(def_hotspots()),
         graph_scoped(def_similar()),
         graph_scoped(def_rename_preview()),
@@ -282,7 +302,9 @@ fn def_search() -> ToolDefinition {
     def_always_load(
         "tokensave_search",
         "Search Symbols",
-        "Search for symbols (functions, structs, traits, etc.) in the code graph by name or keyword.",
+        "Search for symbols (functions, structs, traits, etc.) in the code graph by name or keyword. \
+         Persistent noise (vendored trees, docs) can be suppressed project-wide via gitignore-style \
+         patterns in .tokensave/queryignore.",
         json!({
             "type": "object",
             "properties": {
@@ -614,7 +636,7 @@ fn def_files() -> ToolDefinition {
     def(
         "tokensave_files",
         "File List",
-        "List indexed project files. Use to explore file structure without reading file contents.",
+        "List indexed project files, including non-code artifacts such as .feature specs, schemas, and fixtures. Use to explore file structure, or to locate files by path pattern, without reading file contents.",
         json!({
             "type": "object",
             "properties": {
@@ -624,7 +646,12 @@ fn def_files() -> ToolDefinition {
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Filter files matching this glob pattern (e.g. '**/*.rs')"
+                    "description": "Filter files matching this glob pattern (e.g. '**/*.rs', '**/*.feature')"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["code", "artifact"],
+                    "description": "Filter by file kind: 'code' for parsed source files, 'artifact' for non-code files tracked by path only (specs, schemas, fixtures, docs). Omit for both."
                 },
                 "format": {
                     "type": "string",
@@ -659,6 +686,37 @@ fn def_affected() -> ToolDefinition {
                 }
             },
             "required": ["files"]
+        }),
+    )
+}
+
+fn def_ambiguous_calls() -> ToolDefinition {
+    def(
+        "tokensave_ambiguous_calls",
+        "Ambiguous Calls",
+        "List call sites the resolver could not pin to a single target, with the \
+         candidates it could not separate. These produce no `calls` edge, because \
+         an edge asserts a specific target and \"one of these\" is not one — so \
+         they are invisible to `callers`, `callees` and `impact`. \
+         \n\nUse this when a call you expect is missing from the graph, or when \
+         `dead_code` seems to have skipped something: a symbol named here is \
+         referenced, just not attributably. You have the source and can usually \
+         tell which candidate was meant from the receiver's type, which the \
+         resolver cannot see. Typically arises where several classes define the \
+         same method name and the receiver's type is unknowable — an untyped \
+         parameter, or a value from an unindexed package.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Restrict to call sites in this file or directory."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum call sites to return (default 25, max 200). A hard cap, not a page: a large codebase can hold thousands."
+                }
+            }
         }),
     )
 }
@@ -763,6 +821,35 @@ fn def_circular() -> ToolDefinition {
                 "max_depth": {
                     "type": "number",
                     "description": "Maximum cycle detection depth (default: 10)"
+                }
+            }
+        }),
+    )
+}
+
+fn def_imports() -> ToolDefinition {
+    def(
+        "tokensave_imports",
+        "Import Graph",
+        "Module-level import dependencies, cycles, and cut simulation. Unlike tokensave_circular (which works on files via symbol edges), this groups by module and reports the actual import statements holding each dependency together — so you can see how many edits removing it would take, and whether cutting it would break a cycle at all.",
+        json!({
+            "type": "object",
+            "properties": {
+                "depth": {
+                    "type": "number",
+                    "description": "Path components to group files into a module, 1-10 (default: 1). Depth 1 makes 'anomaly/alerts/slack.py' the module 'anomaly'; depth 2 makes it 'anomaly/alerts'."
+                },
+                "module": {
+                    "type": "string",
+                    "description": "Report the individual import statements for dependencies into or out of this module. Omit to get only the cycle summary."
+                },
+                "simulate_removal_from": {
+                    "type": "string",
+                    "description": "With simulate_removal_to: recompute cycles as if this dependency did not exist, to test whether a proposed cut actually breaks anything."
+                },
+                "simulate_removal_to": {
+                    "type": "string",
+                    "description": "Target module of the simulated cut. Requires simulate_removal_from."
                 }
             }
         }),
@@ -2091,15 +2178,24 @@ fn def_field_sites() -> ToolDefinition {
          read_sites (everything else). Each entry includes file, line, \
          enclosing symbol, and a source snippet. Useful when renaming, \
          removing, or adding an invariant to a field — the write-site list \
-         is the exact blast radius. Pattern matches `.<field>` references; \
-         field-by-name is shorthand for any struct's same-named field, while \
-         `Struct::field` form narrows to a specific declaration.",
+         is the exact blast radius. write_count/read_count are totals over \
+         the whole scan; when `truncated` is true the site arrays were capped \
+         at `limit` and write_returned/read_returned say how many are listed. \
+         Pattern matches `.<field>` references, so a bare field name matches \
+         any struct's same-named field. The `Struct::field` form narrows to \
+         that struct: a site is kept only when its receiver resolves to the \
+         type, via an explicit declaration, a self/receiver binding, or a \
+         declared field type. Receivers a source-text scan cannot type — a \
+         value returned by a call, or read out of a container — are counted \
+         in `unattributed_count` and NOT listed, so a narrowed count is a \
+         lower bound; `excluded_count` is how many resolved to another type. \
+         Query the bare name for the unnarrowed answer.",
         json!({
             "type": "object",
             "properties": {
                 "field": {
                     "type": "string",
-                    "description": "Field name. Bare name ('last_sync_at') matches across structs; qualified form ('GraphStats::last_sync_at') narrows to one struct's field."
+                    "description": "Field name. Bare name ('last_sync_at') matches across structs. The qualified form ('GraphStats::last_sync_at') narrows to that struct's field; sites whose receiver cannot be typed are reported in unattributed_count rather than listed, so a narrowed result is a lower bound."
                 },
                 "writes_only": {
                     "type": "boolean",
@@ -2125,8 +2221,12 @@ fn def_constructors() -> ToolDefinition {
          relative to the struct's current definition (from the graph). The \
          missing-fields list is the typical refactor signal: after adding a \
          required field, this tool surfaces every site that needs updating, \
-         before cargo even compiles. Currently best-effort for Rust source; \
-         pattern matching ignores `match` arms and `if let` patterns.",
+         before cargo even compiles. Scans for `Name { ... }` literal syntax, \
+         so it answers for Rust and Go only; for a type declared in any other \
+         language the response is `language_supported: false` with no \
+         `match_count`, rather than a zero that would read as 'never \
+         constructed'. Pattern matching ignores `match` arms and `if let` \
+         patterns.",
         json!({
             "type": "object",
             "properties": {
@@ -2577,6 +2677,7 @@ fn def_diff() -> ToolDefinition {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::unreadable_literal)]
 mod tests {
     use super::*;
+    use crate::mcp::server::LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS;
     use std::collections::BTreeSet;
 
     fn canonical_graph_scoped_tools() -> BTreeSet<&'static str> {
@@ -2589,6 +2690,7 @@ mod tests {
             "tokensave_node",
             "tokensave_files",
             "tokensave_dead_code",
+            "tokensave_ambiguous_calls",
             "tokensave_module_api",
             "tokensave_circular",
             "tokensave_hotspots",
@@ -2631,9 +2733,51 @@ mod tests {
             "tokensave_call_chain",
             "tokensave_file_dependents",
             "tokensave_find_exact_symbol",
+            "tokensave_imports",
         ]
         .into_iter()
         .collect()
+    }
+
+    /// Selector-less tools intentionally outside branch-drift refusal.
+    ///
+    /// This list pins the current runtime policy. It includes non-graph tools
+    /// as well as graph-reading operations whose existing behavior is exempt.
+    fn canonical_selectorless_drift_exempt_tools() -> BTreeSet<&'static str> {
+        let mut tools = [
+            "tokensave_blame",
+            "tokensave_branch_diff",
+            "tokensave_branch_list",
+            "tokensave_branch_search",
+            "tokensave_changelog",
+            "tokensave_commit_context",
+            "tokensave_config",
+            "tokensave_dependencies",
+            "tokensave_diff",
+            "tokensave_insert_at",
+            "tokensave_insert_at_symbol",
+            "tokensave_log",
+            "tokensave_multi_str_replace",
+            "tokensave_port_order",
+            "tokensave_port_status",
+            "tokensave_pr_context",
+            "tokensave_record_code_area",
+            "tokensave_record_decision",
+            "tokensave_replace_symbol",
+            "tokensave_run_affected_tests",
+            "tokensave_runtime",
+            "tokensave_session_end",
+            "tokensave_session_recall",
+            "tokensave_session_start",
+            "tokensave_status",
+            "tokensave_str_replace",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if ast_grep_available() {
+            tools.insert("tokensave_ast_grep_rewrite");
+        }
+        tools
     }
 
     #[test]
@@ -2667,10 +2811,36 @@ mod tests {
             );
 
             if expected {
-                assert_eq!(graph_root.unwrap()["type"], "string", "{}", definition.name);
+                // A union, not `"string"`: a single root is still a string, and
+                // `search`/`files` also accept an array to federate across
+                // roots (#376). Spelled `anyOf` rather than
+                // `"type": ["string", "array"]` because Gemini rejects the
+                // latter (#440), and asserted exactly rather than loosened to
+                // "any type" so a future edit cannot quietly widen what
+                // callers may pass — or regress to the union that broke.
+                assert!(
+                    graph_root.unwrap().get("type").is_none(),
+                    "{} must not carry a union `type` (#440)",
+                    definition.name
+                );
+                assert_eq!(
+                    graph_root.unwrap()["anyOf"],
+                    serde_json::json!([
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ]),
+                    "{}",
+                    definition.name
+                );
                 assert_eq!(
                     graph_root.unwrap()["description"],
-                    "Exact absolute initialized project root to query.",
+                    "Exact absolute initialized project root to query. Omit to query the \
+                     project this server already serves; when present it must name a different \
+                     project. `tokensave_search` and `tokensave_files` also accept an array of \
+                     roots and answer across all of them at once, interleaving results by rank; \
+                     roots that are worktrees of a repository already named are collapsed, and \
+                     the response says which. Every other tool answers about a single graph and \
+                     rejects an array.",
                     "{}",
                     definition.name
                 );
@@ -2682,7 +2852,7 @@ mod tests {
                 );
                 assert_eq!(
                     graph_branch.unwrap()["description"],
-                    "Exact tracked branch to query within graph_root.",
+                    "Exact tracked branch to query within graph_root. Requires graph_root.",
                     "{}",
                     definition.name
                 );
@@ -2704,8 +2874,57 @@ mod tests {
             .filter(|definition| is_graph_scoped_tool(definition))
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(actual.len(), 50);
+        assert_eq!(actual.len(), 52);
         assert_eq!(actual, canonical);
+    }
+
+    #[test]
+    fn every_registered_tool_has_explicit_drift_classification() {
+        let definitions = get_tool_definitions();
+        let all_registered = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let selector_capable = definitions
+            .iter()
+            .filter(|definition| is_graph_scoped_tool(definition))
+            .map(|definition| definition.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let exempt_selectorless = canonical_selectorless_drift_exempt_tools();
+        let refused_selectorless = LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let multiply_classified = selector_capable
+            .intersection(&refused_selectorless)
+            .chain(selector_capable.intersection(&exempt_selectorless))
+            .chain(refused_selectorless.intersection(&exempt_selectorless))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let classified = selector_capable
+            .union(&refused_selectorless)
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .union(&exempt_selectorless)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let added_unclassified = all_registered
+            .difference(&classified)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let removed_stale = classified
+            .difference(&all_registered)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            added_unclassified.is_empty()
+                && removed_stale.is_empty()
+                && multiply_classified.is_empty(),
+            "drift classification mismatch: added/unclassified={added_unclassified:?}, \
+             removed/stale={removed_stale:?}, multiply classified={multiply_classified:?}"
+        );
     }
 
     #[test]

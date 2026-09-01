@@ -44,9 +44,30 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 eprintln!("  {name}{marker} — {size}{parent}, synced {synced}");
             }
         }
-        BranchAction::Add { name, path } => {
+        BranchAction::Add {
+            name,
+            path,
+            if_enabled,
+        } => {
             let project_path = tokensave::config::resolve_path(path);
             let tokensave_dir = get_tokensave_dir(&project_path);
+
+            // #397: an automated caller (the `post-checkout` hook) passes
+            // `--if-enabled` so the `auto_track` knob governs this path too.
+            // Before this, `auto_track` was read only inside `TokenSave::open`
+            // and the hook tracked unconditionally, so the knob was not
+            // authoritative — on fresh installs as much as old ones. Checked
+            // before anything is read or written, so a declined auto-track
+            // costs nothing. Silent by design: a hook runs on every checkout
+            // and must not narrate.
+            if if_enabled {
+                let config = tokensave::config::load_config(&project_path).unwrap_or_default();
+                let enabled =
+                    tokensave::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track);
+                if !enabled {
+                    return Ok(());
+                }
+            }
 
             let branch_name = match name {
                 Some(n) => n,
@@ -512,33 +533,38 @@ pub(crate) async fn init_and_index(
         // diff; offer the tracked .gitignore as an explicit opt-in.
         //
         // Skipped entirely outside a git working tree — neither answer has any
-        // effect there — and when stdin isn't a TTY, so a scripted or
-        // agent-driven `init` never consumes a line of the caller's stdin and
-        // takes it for an answer (#288). Success is reported only when the
-        // helper confirms the entry was actually written.
+        // effect there. When stdin isn't a TTY, the prompt is skipped so a
+        // scripted or agent-driven `init` never consumes a line of the caller's
+        // stdin and takes it for an answer (#288), but the write itself needs
+        // no answer, so the default local exclusion is still applied (#373).
+        // Success is reported only when the helper confirms the entry was
+        // actually written.
         if tokensave::config::is_inside_git_repo(project_path)
             && !tokensave::config::is_in_gitignore(project_path)
-            && io::stdin().is_terminal()
         {
-            eprint!(
-                "Exclude .tokensave from git? [Y] .git/info/exclude (local) / [g] .gitignore (tracked) / [n] no "
-            );
-            io::stderr().flush().ok();
-            let mut answer = String::new();
-            if io::stdin().lock().read_line(&mut answer).is_ok() {
-                let answer = answer.trim();
-                let reported = if answer.eq_ignore_ascii_case("g") {
-                    tokensave::config::add_to_gitignore(project_path)
-                        .then_some("Added .tokensave to .gitignore")
-                } else if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
-                    tokensave::config::add_to_git_info_exclude(project_path)
-                        .then_some("Added .tokensave/ to .git/info/exclude (local, untracked)")
-                } else {
-                    None
-                };
-                if let Some(message) = reported {
-                    eprintln!("{message}");
+            if io::stdin().is_terminal() {
+                eprint!(
+                    "Exclude .tokensave from git? [Y] .git/info/exclude (local) / [g] .gitignore (tracked) / [n] no "
+                );
+                io::stderr().flush().ok();
+                let mut answer = String::new();
+                if io::stdin().lock().read_line(&mut answer).is_ok() {
+                    let answer = answer.trim();
+                    let reported = if answer.eq_ignore_ascii_case("g") {
+                        tokensave::config::add_to_gitignore(project_path)
+                            .then_some("Added .tokensave to .gitignore")
+                    } else if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+                        tokensave::config::add_to_git_info_exclude(project_path)
+                            .then_some("Added .tokensave/ to .git/info/exclude (local, untracked)")
+                    } else {
+                        None
+                    };
+                    if let Some(message) = reported {
+                        eprintln!("{message}");
+                    }
                 }
+            } else if tokensave::config::add_to_git_info_exclude(project_path) {
+                eprintln!("Added .tokensave/ to .git/info/exclude (local, untracked)");
             }
         }
         cg
@@ -578,6 +604,9 @@ pub(crate) async fn init_and_index(
         // Verbose already emitted the full per-extension list mid-run, so the
         // compact headline (and its "rerun with --verbose" hint) would repeat it.
         print_skipped_extension_summary(&result.skipped_extensions);
+    }
+    if let Some(warning) = cg.warn_skipped_hidden_dirs() {
+        eprintln!("{warning}");
     }
     global::update_global_db(&cg).await;
     Ok(cg)
@@ -806,8 +835,15 @@ pub(crate) fn print_skipped_extension_summary(skipped: &[(String, usize)]) {
         eprintln!();
         eprintln!("\x1b[33m{headline}\x1b[0m");
         eprintln!(
-            "\x1b[2m  No extractor is registered for these extensions. \
-             Rerun with --doctor (or --verbose) for the full list.\x1b[0m"
+            // Naming `artifact_extensions` here is the difference between a
+            // dead end and a next step (#442): a text format with no extractor
+            // still gets a `files` row when listed there, and a row is what
+            // makes it reachable by `tokensave_files` and by literal search.
+            "\x1b[2m  No extractor is registered for these extensions, so no symbols were \
+             indexed from them.\n  A text format worth searching by path or content \
+             (templates, stylesheets, configs) can be added to \"artifact_extensions\" in \
+             .tokensave/config.json — tracked by path, never parsed.\n  Rerun with --doctor \
+             (or --verbose) for the full list.\x1b[0m"
         );
     }
 }

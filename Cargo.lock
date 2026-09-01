@@ -2672,8 +2672,6 @@ dependencies = [
 [[package]]
 name = "libsql"
 version = "0.9.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30fe980ac5693ed1f3db490559fb578885e913a018df64af8a1a46e1959a78df"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4159,7 +4157,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokensave"
-version = "7.8.1"
+version = "7.11.0"
 dependencies = [
  "bincode",
  "cc",
@@ -4199,6 +4197,7 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-hlsl",
  "tree-sitter-language",
+ "tree-sitter-systemverilog",
  "ureq",
  "walkdir",
  "windows-sys 0.61.2",
@@ -4949,6 +4948,16 @@ name = "tree-sitter-swift"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-systemverilog"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc40d99fa6fb0a24b9eb62082b5667d40359b5da175d17d44052b3b1bf9dcca9"
 dependencies = [
  "cc",
  "tree-sitter-language",

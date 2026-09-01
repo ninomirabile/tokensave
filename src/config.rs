@@ -87,6 +87,108 @@ pub struct TokenSaveConfig {
     /// switch when `tokensave install` set it up.
     #[serde(default)]
     pub auto_track: bool,
+    /// Refuse `tokensave_*` MCP calls when the index describes a different
+    /// working tree than the one you are in, instead of answering with a
+    /// warning attached (#372 §2). Defaults to `false`.
+    ///
+    /// Two conditions qualify: a borrowed worktree index (#312), and a branch
+    /// that drifted under a running server (#400). Both are detected already;
+    /// this only decides whether a detection warns or refuses.
+    ///
+    /// The argument for opting in is that a wrong answer is worse than no
+    /// answer: every tool built on top of tokensave — an agent rule saying
+    /// "always check tokensave before reading files", say — inherits the
+    /// wrong-tree result with no signal that anything is off, and an empty
+    /// result reads as "no such symbol". The argument for it staying opt-in is
+    /// that a shared index across a family of worktrees is a legitimate setup,
+    /// and hard-erroring it would be a bad surprise.
+    ///
+    /// The diagnostic tools (`status`, `config`, `diagnose`, `diagnostics`)
+    /// are never refused, so the refusal stays investigable from inside the
+    /// session that hit it.
+    #[serde(default)]
+    pub strict_tree: bool,
+    /// Ceiling on how many files a single *automatic* sync will take on
+    /// before refusing (#396, #393). `0` disables the check.
+    ///
+    /// Applies only to syncs the user did not ask for — the MCP server's
+    /// startup catch-up and its per-`tools/call` staleness check. An explicit
+    /// `tokensave sync` is unbounded and is the supported way to index a large
+    /// change deliberately. The 30 s cooldown bounds how *often* an automatic
+    /// sync runs, never what one costs, so the file count is capped as well.
+    #[serde(default = "default_max_auto_sync_files")]
+    pub max_auto_sync_files: usize,
+    /// Surface per-call savings to the agent, so it can report them to the
+    /// user. Defaults to `true` (current behavior). When `false`, tool results
+    /// omit the `tokensave_metrics:` line and the MCP `instructions` drop the
+    /// sentence asking the agent to report savings — the two things that make a
+    /// model spend *output* tokens narrating what tokensave saved on *input*
+    /// (#356). The `TOKENSAVE_REPORT_SAVINGS` env var overrides this per-run.
+    /// Accounting is unaffected either way: savings are still recorded to the
+    /// global DB, so `tokensave gain` and `tokensave list` keep working.
+    #[serde(default = "default_report_savings")]
+    pub report_savings: bool,
+    /// Extensions of non-code files tracked by path so `tokensave_files` can
+    /// find them (#323). These are never parsed and contribute no symbols; the
+    /// point is that a question like "where are the `.feature` files?" has a
+    /// graph answer, since the shell alternative is blocked by the hook.
+    ///
+    /// An extension already handled by a language extractor is ignored here —
+    /// the symbol pass owns those files and records them with their symbols.
+    #[serde(default = "default_artifact_extensions")]
+    pub artifact_extensions: Vec<String>,
+    /// Silence the index-scope warning `serve` prints for a home-directory
+    /// project or an index past 5 GB (#450). Defaults to `false`.
+    ///
+    /// The warning is not a refusal: applying #396's cap to an index that
+    /// already exists would decide for the user which of their working setups
+    /// stop working, and no threshold does that without breaking somebody who
+    /// is currently fine. Someone who deliberately indexes a very large tree
+    /// is not wrong, only unusual — this is the switch that says so once
+    /// instead of on every server start.
+    #[serde(default)]
+    pub suppress_scope_warning: bool,
+}
+
+/// Serde default for [`TokenSaveConfig::artifact_extensions`].
+///
+/// Deliberately narrow: these are the formats that carry project meaning and
+/// are looked up by path — specifications, schemas, fixtures, and docs. Adding
+/// every text extension would turn `tokensave_files` into a directory listing.
+fn default_artifact_extensions() -> Vec<String> {
+    [
+        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md",
+    ]
+    .iter()
+    .map(|ext| (*ext).to_string())
+    .collect()
+}
+
+/// Serde default for [`TokenSaveConfig::report_savings`], so configs written
+/// before #356 keep reporting savings rather than silently going quiet.
+fn default_report_savings() -> bool {
+    true
+}
+
+/// Serde default for [`TokenSaveConfig::max_auto_sync_files`], so configs
+/// written before #396 gain the bound instead of staying unbounded.
+fn default_max_auto_sync_files() -> usize {
+    crate::tokensave::DEFAULT_MAX_AUTO_SYNC_FILES
+}
+
+/// Resolves a boolean setting that an environment variable may override.
+///
+/// Presence of `var` enables the setting unless its value is explicitly falsey
+/// (`0`, `false`, `no`, `off`, or empty); absence falls back to `config_value`.
+/// This is the convention `TOKENSAVE_AUTO_TRACK` established.
+pub fn env_bool_override(var: &str, config_value: bool) -> bool {
+    match std::env::var(var) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | ""
+        ),
+        Err(_) => config_value,
+    }
 }
 
 impl Default for TokenSaveConfig {
@@ -126,6 +228,11 @@ impl Default for TokenSaveConfig {
             docs_dir: default_docs_dir(),
             last_indexed_version: String::new(),
             auto_track: false,
+            strict_tree: false,
+            max_auto_sync_files: default_max_auto_sync_files(),
+            report_savings: default_report_savings(),
+            artifact_extensions: default_artifact_extensions(),
+            suppress_scope_warning: false,
         }
     }
 }
@@ -657,8 +764,8 @@ pub fn load_query_ignore(project_root: &Path) -> QueryIgnore {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        is_excluded, is_excluded_dir, is_ignored_by_git, is_included, load_query_ignore,
-        QueryIgnore, TokenSaveConfig,
+        env_bool_override, is_excluded, is_excluded_dir, is_ignored_by_git, is_included,
+        load_query_ignore, QueryIgnore, TokenSaveConfig,
     };
     use std::fs;
     use std::process::Command;
@@ -839,5 +946,39 @@ mod tests {
         assert!(qi.is_ignored("src/generated/x.rs"));
         assert!(qi.is_ignored("tests/foo.rs"));
         assert!(!qi.is_ignored("src/main.rs"));
+    }
+
+    #[test]
+    fn report_savings_defaults_to_on() {
+        // #356 asked for an opt-out, not a change of default.
+        assert!(TokenSaveConfig::default().report_savings);
+    }
+
+    #[test]
+    fn configs_written_before_the_field_existed_keep_reporting() {
+        // Serde must not read a missing field as `false` and silently go quiet
+        // on every project initialized before #356.
+        let json = r#"{"version":1,"root_dir":"/x","exclude":[],"max_file_size":1000,
+                       "extract_docstrings":true,"track_call_sites":true}"#;
+        let config: TokenSaveConfig = serde_json::from_str(json).unwrap();
+        assert!(config.report_savings);
+    }
+
+    #[test]
+    fn report_savings_round_trips_when_disabled() {
+        let config = TokenSaveConfig {
+            report_savings: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TokenSaveConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.report_savings);
+    }
+
+    #[test]
+    fn env_override_respects_falsey_spellings() {
+        // Absent → the config value wins, in both directions.
+        assert!(env_bool_override("TOKENSAVE_UNSET_TEST_VAR_XYZ", true));
+        assert!(!env_bool_override("TOKENSAVE_UNSET_TEST_VAR_XYZ", false));
     }
 }

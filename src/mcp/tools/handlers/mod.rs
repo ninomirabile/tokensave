@@ -13,12 +13,13 @@ pub mod graph;
 pub mod health;
 pub mod info;
 pub mod memory;
+pub mod receiver_type;
 pub mod redundancy;
 pub mod workflow;
 
 use std::collections::HashSet;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::errors::{Result, TokenSaveError};
 use crate::tokensave::TokenSave;
@@ -165,6 +166,44 @@ pub(crate) fn unique_file_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec
     result
 }
 
+/// Advice attached wherever sibling projects are surfaced.
+pub(crate) const SIBLING_HINT: &str =
+    "Other initialized projects sit beside this one. If a symbol is missing here, \
+     retry the same call with graph_root set to one of them.";
+
+/// Returns the initialized projects sitting directly beside `project_root`.
+///
+/// Best-effort like every other global-DB read: an unavailable global DB yields
+/// no siblings rather than an error, since this only ever adds a hint.
+pub(crate) async fn sibling_projects(project_root: &std::path::Path) -> Vec<String> {
+    match crate::global_db::GlobalDb::open().await {
+        Some(gdb) => gdb.sibling_projects(project_root).await,
+        None => Vec::new(),
+    }
+}
+
+/// Builds the empty-result payload naming reachable sibling graphs, if any.
+///
+/// Returns `None` when the caller has results to return, or when no sibling
+/// project exists — in both cases the ordinary response shape is kept.
+pub(crate) async fn sibling_note(
+    is_empty: bool,
+    project_root: &std::path::Path,
+) -> Option<serde_json::Value> {
+    if !is_empty {
+        return None;
+    }
+    let siblings = sibling_projects(project_root).await;
+    if siblings.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "results": [],
+        "sibling_projects": siblings,
+        "hint": SIBLING_HINT,
+    }))
+}
+
 /// Truncates a string to the maximum response character limit, appending
 /// a truncation notice if necessary.
 pub(crate) fn truncate_response(s: &str) -> String {
@@ -179,6 +218,151 @@ pub(crate) fn truncate_response(s: &str) -> String {
         }
         format!("{}\n\n[... truncated at {} chars]", &s[..end], end)
     }
+}
+
+/// Serializes a structured payload for a tool response without ever emitting
+/// text that has stopped being JSON.
+///
+/// `truncate_response` slices an already-serialized string, which leaves the
+/// caller holding a half-written object — `jq` fails and the CLI still exits 0
+/// (#486). Here the payload is bounded *before* serialization by shedding whole
+/// elements off the arrays named in `shedable`, so every byte we emit parses.
+///
+/// `shedable` names the arrays that may lose elements, in the order they should
+/// be sacrificed (least useful first); a name may be a dotted path into nested
+/// objects, e.g. `"changes.impacted_symbols"`. What was dropped is recorded
+/// under a top-level `truncated` object, one entry per shed array:
+/// `{"impacted_symbols": {"shown": 40, "total": 900}}`.
+pub(crate) fn serialize_bounded_json(value: &Value, shedable: &[&str]) -> String {
+    let fits = |v: &Value| -> Option<String> {
+        let s = serde_json::to_string_pretty(v).unwrap_or_default();
+        (s.len() <= MAX_RESPONSE_CHARS).then_some(s)
+    };
+    if let Some(s) = fits(value) {
+        return s;
+    }
+
+    let mut working = value.clone();
+    let mut totals: Vec<(&str, usize)> = Vec::new();
+    for path in shedable {
+        if let Some(len) = array_at(&working, path).map(Vec::len) {
+            totals.push((path, len));
+        }
+    }
+
+    // Halve the longest remaining array each round. Halving (rather than
+    // popping) keeps this O(log n) serializations instead of one per dropped
+    // element, which matters when a wide impact radius yields tens of
+    // thousands of symbols.
+    loop {
+        let longest = totals
+            .iter()
+            .filter_map(|(path, _)| {
+                let len = array_at(&working, path)?.len();
+                (len > 0).then_some((len, *path))
+            })
+            .max_by_key(|(len, _)| *len);
+        let Some((len, path)) = longest else {
+            break;
+        };
+        let keep = len / 2;
+        if let Some(arr) = array_at_mut(&mut working, path) {
+            arr.truncate(keep);
+        }
+        set_truncation_note(&mut working, path, keep, &totals);
+        if let Some(s) = fits(&working) {
+            return s;
+        }
+    }
+
+    // Nothing left to shed and the remainder still does not fit: the payload's
+    // scalar content alone is over budget. Report that as JSON rather than
+    // handing back a sliced object.
+    let note = json!({
+        "truncated": {
+            "error": "payload exceeds the response limit even with every list emptied",
+            "limit_chars": MAX_RESPONSE_CHARS,
+            "totals": totals.iter().map(|(p, n)| json!({"field": p, "total": n})).collect::<Vec<_>>(),
+        }
+    });
+    serde_json::to_string_pretty(&note).unwrap_or_default()
+}
+
+/// Records, under a top-level `truncated` object, that `path` was cut down to
+/// `keep` of its original element count.
+fn set_truncation_note(root: &mut Value, path: &str, keep: usize, totals: &[(&str, usize)]) {
+    let total = totals
+        .iter()
+        .find(|(p, _)| *p == path)
+        .map_or(keep, |(_, n)| *n);
+    let key = path.rsplit('.').next().unwrap_or(path).to_string();
+    let entry = json!({"shown": keep, "total": total});
+    match root.get_mut("truncated").and_then(Value::as_object_mut) {
+        Some(map) => {
+            map.insert(key, entry);
+        }
+        None => {
+            if let Some(map) = root.as_object_mut() {
+                map.insert("truncated".to_string(), json!({key: entry}));
+            }
+        }
+    }
+}
+
+/// Resolves a dotted path to an array inside `root`.
+fn array_at<'a>(root: &'a Value, path: &str) -> Option<&'a Vec<Value>> {
+    let mut cur = root;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    cur.as_array()
+}
+
+/// Mutable counterpart of `array_at`.
+fn array_at_mut<'a>(root: &'a mut Value, path: &str) -> Option<&'a mut Vec<Value>> {
+    let mut cur = root;
+    for seg in path.split('.') {
+        cur = cur.get_mut(seg)?;
+    }
+    cur.as_array_mut()
+}
+
+/// Like `truncate_response`, but everything from the last occurrence of
+/// `marker` to the end of the string survives truncation as a suffix.
+///
+/// `tokensave_context` ends with the `### Retrieval` diagnostics footer,
+/// followed by `seen_node_ids` and occasional hints — the small, load-bearing
+/// tail of the response. Plain prefix truncation removes exactly that tail
+/// whenever the Code section is large, which is also when a caller most needs
+/// to know whether the retrieval behind it was trustworthy. The truncation
+/// notice stays where content was cut, so the seam remains visible.
+///
+/// Falls back to plain truncation when the marker is absent or the tail is
+/// too large to be the footer it is meant for (a marker echoed inside a huge
+/// code block must not defeat the response limit).
+pub(crate) fn truncate_response_keep_tail(s: &str, marker: &str) -> String {
+    const MAX_TAIL_CHARS: usize = 2_000;
+    if s.len() <= MAX_RESPONSE_CHARS {
+        return s.to_string();
+    }
+    let Some(idx) = s.rfind(marker) else {
+        return truncate_response(s);
+    };
+    let tail = &s[idx..];
+    if tail.len() > MAX_TAIL_CHARS {
+        return truncate_response(s);
+    }
+    let budget = MAX_RESPONSE_CHARS - tail.len();
+    let mut end = budget.min(idx);
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[... truncated at {} chars]\n\n{}",
+        &s[..end],
+        end,
+        tail
+    )
 }
 
 /// Edit tools resolve an absolute `path` verbatim (see
@@ -280,10 +464,14 @@ pub async fn handle_tool_call(
         "tokensave_files" => info::handle_files(cg, args, scope_prefix).await,
         "tokensave_affected" => git::handle_affected(cg, args).await,
         "tokensave_dead_code" => analysis::handle_dead_code(cg, args, scope_prefix).await,
+        "tokensave_ambiguous_calls" => {
+            analysis::handle_ambiguous_calls(cg, args, scope_prefix).await
+        }
         "tokensave_diff" => git::handle_diff(cg, args).await,
         "tokensave_diff_context" => git::handle_diff_context(cg, args).await,
         "tokensave_module_api" => analysis::handle_module_api(cg, args, scope_prefix).await,
         "tokensave_circular" => analysis::handle_circular(cg, args).await,
+        "tokensave_imports" => analysis::handle_imports(cg, args).await,
         "tokensave_hotspots" => analysis::handle_hotspots(cg, args, scope_prefix).await,
         "tokensave_similar" => graph::handle_similar(cg, args).await,
         "tokensave_rename_preview" => graph::handle_rename_preview(cg, args).await,
@@ -380,6 +568,112 @@ mod tests {
     use super::super::get_tool_definitions;
     use super::*;
 
+    /// #486: a payload over the limit must still serialize to parseable JSON.
+    #[test]
+    fn bounded_json_stays_parseable_when_oversized() {
+        let items: Vec<Value> = (0..5_000)
+            .map(|i| json!({"id": format!("node-{i}"), "name": "some_function_name"}))
+            .collect();
+        let payload = json!({
+            "changed_files": ["src/foo.rs"],
+            "impacted_symbols_count": items.len(),
+            "impacted_symbols": items,
+        });
+        let out = serialize_bounded_json(&payload, &["impacted_symbols"]);
+        assert!(out.len() <= MAX_RESPONSE_CHARS, "len {}", out.len());
+        let parsed: Value = serde_json::from_str(&out).expect("output must be valid JSON");
+        assert_eq!(parsed["impacted_symbols_count"], 5_000);
+        let shown = parsed["impacted_symbols"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 5_000, "shown {shown}");
+        assert_eq!(parsed["truncated"]["impacted_symbols"]["shown"], shown);
+        assert_eq!(parsed["truncated"]["impacted_symbols"]["total"], 5_000);
+        assert!(!out.contains("[... truncated at"));
+    }
+
+    #[test]
+    fn bounded_json_leaves_small_payload_untouched() {
+        let payload = json!({"impacted_symbols": [{"id": "a"}]});
+        let out = serialize_bounded_json(&payload, &["impacted_symbols"]);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed, payload);
+        assert!(parsed.get("truncated").is_none());
+    }
+
+    /// Sheds in the order given: the first list is sacrificed before the ones
+    /// after it, so a caller's ranking of what matters is respected.
+    #[test]
+    fn bounded_json_sheds_in_declared_order() {
+        let big: Vec<Value> = (0..4_000)
+            .map(|i| json!({"i": i, "pad": "xxxxxxxxxx"}))
+            .collect();
+        let payload = json!({"first": big.clone(), "second": ["keep-me"]});
+        let out = serialize_bounded_json(&payload, &["first", "second"]);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["second"], json!(["keep-me"]));
+        assert!(parsed["first"].as_array().unwrap().len() < 4_000);
+    }
+
+    /// Nested (dotted) paths are what `tokensave_diff` uses for its envelope.
+    #[test]
+    fn bounded_json_sheds_through_dotted_path() {
+        let items: Vec<Value> = (0..5_000)
+            .map(|i| json!({"id": i, "pad": "yyyyyyyyyy"}))
+            .collect();
+        let payload =
+            json!({"delegated_to": "diff_context", "changes": {"impacted_symbols": items}});
+        let out = serialize_bounded_json(&payload, &["changes.impacted_symbols"]);
+        assert!(out.len() <= MAX_RESPONSE_CHARS);
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["delegated_to"], "diff_context");
+        assert_eq!(parsed["truncated"]["impacted_symbols"]["total"], 5_000);
+    }
+
+    /// Unshedable bulk (one giant scalar) still yields JSON, not a sliced object.
+    #[test]
+    fn bounded_json_reports_when_nothing_can_be_shed() {
+        let payload = json!({"blob": "z".repeat(MAX_RESPONSE_CHARS + 100)});
+        let out = serialize_bounded_json(&payload, &["items"]);
+        let parsed: Value = serde_json::from_str(&out).expect("output must be valid JSON");
+        assert!(parsed["truncated"]["error"].is_string());
+    }
+
+    #[test]
+    fn test_truncate_keep_tail_preserves_footer_and_ids() {
+        let body = "x".repeat(MAX_RESPONSE_CHARS + 5_000);
+        let tail =
+            "### Retrieval\n- match: strong (best score 12.00)\n\nseen_node_ids: [\"a\",\"b\"]\n";
+        let s = format!("{body}\n{tail}");
+        let out = truncate_response_keep_tail(&s, "### Retrieval");
+        assert!(out.contains("[... truncated at"), "{}", &out[..200]);
+        assert!(out.ends_with(tail), "tail must survive truncation");
+        assert!(out.len() <= MAX_RESPONSE_CHARS + 100, "len {}", out.len());
+    }
+
+    #[test]
+    fn test_truncate_keep_tail_short_input_unchanged() {
+        let s = "short\n### Retrieval\n- match: exact\n";
+        assert_eq!(truncate_response_keep_tail(s, "### Retrieval"), s);
+    }
+
+    #[test]
+    fn test_truncate_keep_tail_falls_back_without_marker() {
+        let s = "y".repeat(MAX_RESPONSE_CHARS + 100);
+        let out = truncate_response_keep_tail(&s, "### Retrieval");
+        assert_eq!(out, truncate_response(&s));
+    }
+
+    #[test]
+    fn test_truncate_keep_tail_rejects_oversized_tail() {
+        // A marker echoed inside a huge code block must not defeat the limit.
+        let s = format!(
+            "{}### Retrieval\n{}",
+            "b".repeat(100),
+            "z".repeat(MAX_RESPONSE_CHARS)
+        );
+        let out = truncate_response_keep_tail(&s, "### Retrieval");
+        assert_eq!(out, truncate_response(&s));
+    }
+
     #[test]
     fn test_tool_definitions_complete() {
         let tools = get_tool_definitions();
@@ -388,9 +682,9 @@ mod tests {
         // tool that will instantly fail. The count and the per-tool checks
         // below adapt to the host's capability set.
         let expected_total = if super::super::definitions::ast_grep_available() {
-            83
+            85
         } else {
-            82
+            84
         };
         assert_eq!(tools.len(), expected_total);
 
@@ -411,6 +705,7 @@ mod tests {
         assert!(tool_names.contains(&"tokensave_impact"));
         assert!(tool_names.contains(&"tokensave_node"));
         assert!(tool_names.contains(&"tokensave_status"));
+        assert!(tool_names.contains(&"tokensave_imports"));
         assert!(tool_names.contains(&"tokensave_files"));
         assert!(tool_names.contains(&"tokensave_affected"));
         assert!(tool_names.contains(&"tokensave_dead_code"));

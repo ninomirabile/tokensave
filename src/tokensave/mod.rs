@@ -17,7 +17,7 @@ use crate::db::Database;
 use crate::errors::{Result, TokenSaveError};
 use crate::extraction::LanguageRegistry;
 use crate::graph::{GraphQueryManager, GraphTraverser};
-use crate::resolution::ReferenceResolver;
+use crate::resolution::{AmbiguityRefKey, ReferenceResolver, TouchedNode, TouchedSet};
 use crate::sync;
 use crate::types::*;
 
@@ -32,6 +32,8 @@ mod util;
 pub(crate) use extract::*;
 pub(crate) use guard::*;
 pub use guard::{try_acquire_sync_lock, SyncLockGuard};
+pub use indexing::detect_skipped_hidden_dirs;
+pub use staleness::{AutoSyncScope, BranchDrift, DEFAULT_MAX_AUTO_SYNC_FILES};
 pub use util::is_test_file;
 pub(crate) use util::*;
 
@@ -50,6 +52,11 @@ pub struct TokenSave {
     serving_branch: Option<String>,
     /// Set when serving from a fallback (ancestor) DB instead of the exact branch.
     fallback_warning: Option<String>,
+    /// Ceiling on how many files a single *automatic* sync will take on
+    /// before refusing (`0` disables the check). Read by
+    /// [`Self::find_stale_files_bounded`]; explicit `sync` ignores it.
+    /// Seeded from `config.max_auto_sync_files`.
+    max_auto_sync_files: usize,
 }
 
 /// A decision recorded by an agent during a session.
@@ -163,6 +170,7 @@ impl TokenSave {
 
         Ok(Self {
             db,
+            max_auto_sync_files: config.max_auto_sync_files,
             config,
             project_root: project_root.to_path_buf(),
             registry: LanguageRegistry::new(),
@@ -175,6 +183,13 @@ impl TokenSave {
     /// Returns a reference to the underlying database.
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Overrides the automatic-sync file ceiling for this handle, without
+    /// touching the on-disk config. Lets a caller (and the bound's tests)
+    /// exercise the limit without materialising thousands of files.
+    pub fn set_max_auto_sync_files(&mut self, limit: usize) {
+        self.max_auto_sync_files = limit;
     }
 
     /// Returns `true` if the project DB schema is older than this build's latest.
@@ -205,15 +220,8 @@ impl TokenSave {
         // a real per-branch DB instead of silently falling back. Best-effort —
         // never fail open() on this. Gated by config.auto_track, overridable
         // per-run via TOKENSAVE_AUTO_TRACK (git-hook path is separate).
-        let auto_track = match std::env::var("TOKENSAVE_AUTO_TRACK") {
-            // Present → enabled unless an explicit falsey value.
-            Ok(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off" | ""
-            ),
-            // Absent → fall back to the per-project config (default false).
-            Err(_) => config.auto_track,
-        };
+        let auto_track =
+            crate::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track);
         if auto_track {
             if let Some(b) = active_branch.as_deref() {
                 match branch::track_branch_copy(project_root, &tokensave_dir, b).await {
@@ -260,6 +268,7 @@ impl TokenSave {
                 let (db, _) = Database::initialize(&db_path).await?;
                 let ts = Self {
                     db,
+                    max_auto_sync_files: config.max_auto_sync_files,
                     config,
                     project_root: project_root.to_path_buf(),
                     registry: LanguageRegistry::new(),
@@ -289,6 +298,7 @@ impl TokenSave {
                 let (new_db, _) = Database::initialize(&db_path).await?;
                 let ts = Self {
                     db: new_db,
+                    max_auto_sync_files: config.max_auto_sync_files,
                     config,
                     project_root: project_root.to_path_buf(),
                     registry: LanguageRegistry::new(),
@@ -322,6 +332,7 @@ impl TokenSave {
 
         let ts = Self {
             db,
+            max_auto_sync_files: config.max_auto_sync_files,
             config,
             project_root: project_root.to_path_buf(),
             registry: LanguageRegistry::new(),
@@ -440,7 +451,11 @@ impl TokenSave {
             })?;
             let path = branch::resolve_branch_db_path(&tokensave_dir, explicit, &meta).ok_or_else(
                 || TokenSaveError::Config {
-                    message: format!("branch '{explicit}' is not tracked"),
+                    message: format!(
+                        "branch '{explicit}' is not tracked; run `tokensave branch add {}` \
+                         in the selected project to track it",
+                        shell_quote(explicit)
+                    ),
                 },
             )?;
             if !path.is_file() {
@@ -469,6 +484,7 @@ impl TokenSave {
         let db = Database::open_read_only(&db_path).await?;
         Ok(Self {
             db,
+            max_auto_sync_files: config.max_auto_sync_files,
             config,
             project_root: project_root.to_path_buf(),
             registry: LanguageRegistry::new(),
@@ -494,7 +510,11 @@ impl TokenSave {
 
         let db_path = branch::resolve_branch_db_path(&tokensave_dir, branch_name, &meta)
             .ok_or_else(|| TokenSaveError::Config {
-                message: format!("branch '{branch_name}' is not tracked"),
+                message: format!(
+                    "branch '{branch_name}' is not tracked; run `tokensave branch add {}` \
+                     to track it",
+                    shell_quote(branch_name)
+                ),
             })?;
 
         if !db_path.exists() {
@@ -509,6 +529,7 @@ impl TokenSave {
         let (db, _) = Database::open(&db_path).await?;
         Ok(Self {
             db,
+            max_auto_sync_files: config.max_auto_sync_files,
             config,
             project_root: project_root.to_path_buf(),
             registry: LanguageRegistry::new(),

@@ -15,7 +15,19 @@ use crate::errors::{Result, TokenSaveError};
 
 /// The highest migration version defined in this file. Bump this and add a
 /// new entry to `run_migration` whenever the schema changes.
-const LATEST_VERSION: u32 = 15;
+const LATEST_VERSION: u32 = 17;
+
+/// Schema for the ambiguity record added in v17 (#412). Used by both
+/// `migrate_v17` and the fresh-schema path, which never replays migrations.
+const AMBIGUOUS_CALLS_SQL: &str = "CREATE TABLE IF NOT EXISTS ambiguous_calls (
+    from_node_id TEXT NOT NULL,
+    reference_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    candidate_node_ids TEXT NOT NULL,
+    PRIMARY KEY (from_node_id, reference_name, line)
+);
+CREATE INDEX IF NOT EXISTS idx_ambiguous_calls_file ON ambiguous_calls(file_path);";
 
 pub(crate) const TRAIT_DISPATCH_TRIGGERS_SQL: &str = r"
 CREATE TRIGGER IF NOT EXISTS trait_dispatch_call_insert
@@ -173,7 +185,8 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_at INTEGER NOT NULL,
             indexed_at INTEGER NOT NULL,
-            node_count INTEGER NOT NULL DEFAULT 0
+            node_count INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'code'
         );
 
         CREATE TABLE IF NOT EXISTS unresolved_refs (
@@ -349,6 +362,16 @@ pub async fn create_schema(conn: &Connection) -> Result<()> {
             operation: "create_schema".to_string(),
         })?;
 
+    // A fresh database is stamped at LATEST_VERSION and never replays
+    // migrations, so anything a migration adds has to be created here too.
+    // Sharing one statement keeps the two definitions from drifting.
+    conn.execute_batch(AMBIGUOUS_CALLS_SQL)
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("failed to create ambiguous_calls: {e}"),
+            operation: "create_schema".to_string(),
+        })?;
+
     set_version(conn, LATEST_VERSION).await?;
     Ok(())
 }
@@ -435,6 +458,8 @@ async fn run_migration(conn: &Connection, version: u32) -> Result<()> {
         13 => migrate_v13(conn).await,
         14 => migrate_v14(conn).await,
         15 => migrate_v15(conn).await,
+        16 => migrate_v16(conn).await,
+        17 => migrate_v17(conn).await,
         _ => Err(TokenSaveError::Database {
             message: format!("unknown migration version: {version}"),
             operation: "run_migration".to_string(),
@@ -483,7 +508,8 @@ async fn migrate_v1(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_at INTEGER NOT NULL,
             indexed_at INTEGER NOT NULL,
-            node_count INTEGER NOT NULL DEFAULT 0
+            node_count INTEGER NOT NULL DEFAULT 0,
+            kind TEXT NOT NULL DEFAULT 'code'
         );
 
         CREATE TABLE IF NOT EXISTS unresolved_refs (
@@ -1501,6 +1527,89 @@ async fn node_columns(conn: &Connection) -> Result<Vec<String>> {
         let name: String = row.get(1).map_err(|e| TokenSaveError::Database {
             message: format!("failed to read column name: {e}"),
             operation: "node_columns".to_string(),
+        })?;
+        cols.push(name);
+    }
+    Ok(cols)
+}
+
+// ---------------------------------------------------------------------------
+// Migration V16: file kind column
+// ---------------------------------------------------------------------------
+
+/// Adds the `kind` column to `files`, distinguishing source from artifacts.
+///
+/// Tracking non-code artifacts (#323) needs a way to tell a source file that
+/// happens to yield no symbols from a file that was never parsed at all, so
+/// analyses meaning "code" can exclude the latter. Existing rows are all
+/// source, which the column default already states.
+///
+/// `migrate_v1` creates `files` with the column, so a database migrated all
+/// the way up from v0 arrives here already holding it; the probe keeps that
+/// path a no-op rather than failing on a duplicate column.
+async fn migrate_v16(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "files").await? {
+        return Ok(());
+    }
+    if table_columns(conn, "files")
+        .await?
+        .iter()
+        .any(|c| c == "kind")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'code';")
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v16: failed to add files.kind: {e}"),
+            operation: "migrate_v16".to_string(),
+        })?;
+    Ok(())
+}
+
+/// v17: records calls the resolver could not disambiguate (#412).
+///
+/// When several candidates tie, no edge is created — an edge is an assertion
+/// and "one of these" is not one — but the alternatives are worth keeping. A
+/// model reading the source can pick the right one; a scoring heuristic that
+/// cannot see the receiver's type cannot.
+///
+/// Keyed by call site rather than by target, because the ambiguity belongs to
+/// the call: the same method name called from two places may be resolvable at
+/// one and not the other. `candidate_node_ids` is a JSON array; the set is
+/// small by construction (a handful of same-named methods) and is never
+/// joined against, only read back whole.
+async fn migrate_v17(conn: &Connection) -> Result<()> {
+    conn.execute_batch(AMBIGUOUS_CALLS_SQL)
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("v17: failed to create ambiguous_calls: {e}"),
+            operation: "migrate_v17".to_string(),
+        })?;
+    Ok(())
+}
+
+/// Returns the column names of `table` via `PRAGMA table_info`.
+async fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    // PRAGMA does not accept a bound parameter for the table name, and this is
+    // only ever called with literals from this module.
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read {table} table_info: {e}"),
+            operation: "table_columns".to_string(),
+        })?;
+    let mut cols = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+        message: format!("failed to read table_info row: {e}"),
+        operation: "table_columns".to_string(),
+    })? {
+        // PRAGMA table_info columns: cid(0), name(1), type(2), ...
+        let name: String = row.get(1).map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read column name: {e}"),
+            operation: "table_columns".to_string(),
         })?;
         cols.push(name);
     }

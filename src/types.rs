@@ -262,6 +262,12 @@ pub enum EdgeKind {
     Receives,
     /// A documentation file describes a source file (#154).
     Documents,
+    /// An HDL module or interface instantiates another (#344).
+    ///
+    /// Kept distinct from `Calls`: a module instantiation is structural
+    /// hierarchy, not invocation, and folding it into `Calls` would pollute
+    /// callers/callees, impact, and dead-code for every other language.
+    Instantiates,
 }
 
 #[allow(clippy::should_implement_trait)]
@@ -280,6 +286,7 @@ impl EdgeKind {
             EdgeKind::Annotates => "annotates",
             EdgeKind::Receives => "receives",
             EdgeKind::Documents => "documents",
+            EdgeKind::Instantiates => "instantiates",
         }
     }
 
@@ -297,6 +304,7 @@ impl EdgeKind {
             "annotates" => Some(EdgeKind::Annotates),
             "receives" => Some(EdgeKind::Receives),
             "documents" => Some(EdgeKind::Documents),
+            "instantiates" => Some(EdgeKind::Instantiates),
             _ => None,
         }
     }
@@ -397,6 +405,49 @@ pub struct Edge {
     pub line: Option<u32>,
 }
 
+/// What kind of file a [`FileRecord`] describes.
+///
+/// Artifacts are tracked so that path-shaped questions ("where are the
+/// `.feature` files?") can be answered from the graph instead of a blocked
+/// shell command (#323). They are deliberately distinguishable from source:
+/// a source file with no extractable symbols is a fact about the code, while
+/// an artifact never had symbols to begin with, and analyses that mean "code"
+/// must not count them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    /// A source file processed by a language extractor.
+    #[default]
+    Code,
+    /// A non-source file tracked by path only; never parsed.
+    Artifact,
+}
+
+impl FileKind {
+    /// Returns the stored string form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Artifact => "artifact",
+        }
+    }
+
+    /// Parses the stored string form, defaulting to [`FileKind::Code`].
+    ///
+    /// Rows written before the `kind` column existed are source files, and so
+    /// is anything unrecognized: mislabelling an artifact as code hides it from
+    /// one filter, while the reverse would drop real source out of analyses.
+    #[must_use]
+    pub fn from_str_or_code(value: &str) -> Self {
+        if value == "artifact" {
+            Self::Artifact
+        } else {
+            Self::Code
+        }
+    }
+}
+
 /// Record tracking an indexed file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -406,6 +457,8 @@ pub struct FileRecord {
     pub modified_at: i64,
     pub indexed_at: i64,
     pub node_count: u32,
+    #[serde(default)]
+    pub kind: FileKind,
 }
 
 /// An unresolved reference found during parsing, to be resolved later.
@@ -632,6 +685,24 @@ pub struct TaskContext {
     pub related_files: Vec<String>,
     /// IDs of all nodes returned as entry points (pass to next call's `exclude_node_ids` for dedup).
     pub seen_node_ids: Vec<String>,
+    /// Retrieval quality signals for this query (which terms hit, best match tier).
+    #[serde(default)]
+    pub diagnostics: RetrievalDiagnostics,
+}
+
+/// Per-query retrieval diagnostics: which search terms found candidates and
+/// how strong the best entry-point match was. Lets the caller distinguish a
+/// strong answer from a vocabulary miss and re-query instead of trusting
+/// weak results.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetrievalDiagnostics {
+    /// `(term, candidate_count)` for each FTS search term, in search order.
+    pub term_hits: Vec<(String, usize)>,
+    /// Highest candidate score after all ranking boosts (`None` if no candidates).
+    pub best_score: Option<f64>,
+    /// Tier of the best match: "exact" (name or source literal), "strong"
+    /// (body/co-occurrence supplement), or "fts-only" (lexical BM25 only).
+    pub match_quality: Option<String>,
 }
 
 /// A block of source code extracted from a file.
@@ -665,9 +736,48 @@ pub fn generate_node_id(file_path: &str, kind: &NodeKind, name: &str, line: u32)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolutionResult {
     pub resolved: Vec<ResolvedRef>,
-    pub unresolved: Vec<UnresolvedRef>,
+    /// Positions in the slice passed to `resolve_all` of the references that
+    /// did **not** resolve, in input order.
+    ///
+    /// Indices rather than the references themselves (#483). This used to be a
+    /// `Vec<UnresolvedRef>`, which meant cloning one owned record — several
+    /// `String`s each — for every reference that failed. On tokensave's own
+    /// tree that is ~160,000 clones per sync, since 189,446 references go in
+    /// and 28,849 resolve, and `resolve_all` was the single largest allocation
+    /// in a sync at +97.7 MiB.
+    ///
+    /// The clones bought nothing: the caller already owns the slice it passed
+    /// in, so an index is the same information. Nothing in the product read
+    /// the field at all — its only consumers are assertions in
+    /// `tests/resolution_test.rs`, which is why it went unnoticed.
+    pub unresolved: Vec<u32>,
     pub total: usize,
     pub resolved_count: usize,
+    /// Calls that had several equally-plausible targets (#412). Not resolved,
+    /// but not silently dropped either.
+    #[serde(default)]
+    pub ambiguous: Vec<AmbiguousCall>,
+}
+
+/// A call the resolver could not disambiguate, kept instead of discarded.
+///
+/// When several candidates tie on every scoring dimension, no edge is created
+/// — an edge is an assertion, and "one of these" is not one. The alternatives
+/// are still worth having: a model reading the source can pick the intended
+/// target, which a scoring heuristic that cannot see the receiver's type
+/// cannot (#412).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmbiguousCall {
+    /// The node containing the call site.
+    pub from_node_id: String,
+    /// The reference as written, e.g. `thing.dispose`.
+    pub reference_name: String,
+    /// File containing the call site.
+    pub file_path: String,
+    /// Line of the call site.
+    pub line: u32,
+    /// The candidates that could not be separated.
+    pub candidate_node_ids: Vec<String>,
 }
 
 /// A reference that has been resolved to a target node.

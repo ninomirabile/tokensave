@@ -41,7 +41,7 @@ impl<'a> ContextBuilder<'a> {
         debug_assert!(options.max_nodes > 0, "max_nodes must be positive");
         // Step 1-3: find relevant subgraph and entry points
         let symbols = extract_symbols_from_query(query);
-        let entry_points = self.find_entry_points(query, &symbols, options).await?;
+        let (entry_points, diagnostics) = self.find_entry_points(query, &symbols, options).await?;
         let subgraph = self.expand_subgraph(&entry_points, options).await?;
 
         // Step 4: extract code blocks from source files
@@ -75,6 +75,7 @@ impl<'a> ContextBuilder<'a> {
             code_blocks,
             related_files,
             seen_node_ids,
+            diagnostics,
         })
     }
 
@@ -88,7 +89,7 @@ impl<'a> ContextBuilder<'a> {
         options: &BuildContextOptions,
     ) -> Result<Subgraph> {
         let symbols = extract_symbols_from_query(query);
-        let entry_points = self.find_entry_points(query, &symbols, options).await?;
+        let (entry_points, _) = self.find_entry_points(query, &symbols, options).await?;
         self.expand_subgraph(&entry_points, options).await
     }
 
@@ -189,12 +190,15 @@ impl<'a> ContextBuilder<'a> {
         query: &str,
         symbols: &[String],
         options: &BuildContextOptions,
-    ) -> Result<Vec<Node>> {
+    ) -> Result<(Vec<Node>, RetrievalDiagnostics)> {
         // Base score for an exact name match. Negated-BM25 scores from
         // `search_nodes_bounded` run roughly 5–30 before structural boosts,
         // so this must sit well above that band for a perfect name match to
         // win the MAX merge over FTS hits and rank ahead of them.
         const EXACT_MATCH_SCORE: f64 = 100.0;
+        // Floor for the "strong" diagnostics tier: supplements and solidly
+        // boosted FTS hits land above this; weak lexical matches fall below.
+        const STRONG_MATCH_SCORE: f64 = 10.0;
         debug_assert!(
             !query.is_empty(),
             "find_entry_points called with empty query"
@@ -208,7 +212,12 @@ impl<'a> ContextBuilder<'a> {
         // name) is merged in place via MAX score rather than first-seen-wins.
         let mut index_of: HashMap<String, usize> = HashMap::new();
         let mut candidates: Vec<SearchResult> = Vec::new();
-        let literal_terms = exact_source_terms(query, &options.extra_keywords);
+        // Qualified paths (`foo::bar`) and verbatim multi-word phrases are both
+        // exact-copy evidence and share one source scan. The phrases matter for
+        // string literals, which live in no symbol name and which FTS ranks
+        // badly when they sit inside a large object literal (#362).
+        let mut literal_terms = exact_source_terms(query, &options.extra_keywords);
+        literal_terms.extend(exact_phrase_terms(query, &options.extra_keywords));
         let exact_source_candidates = self
             .find_exact_source_candidates(&literal_terms, options)
             .await?;
@@ -269,6 +278,14 @@ impl<'a> ContextBuilder<'a> {
                     .into(),
             );
         }
+        // Record per-term hit counts before the fill loop consumes the queues.
+        // Counts are capped at `fetch_limit` by the bounded query; zero-hit
+        // terms are the signal the caller needs to reformulate.
+        let term_hits: Vec<(String, usize)> = fts_terms
+            .iter()
+            .zip(&per_term)
+            .map(|(term, queue)| (term.clone(), queue.len()))
+            .collect();
         'fill: loop {
             let mut advanced = false;
             for queue in &mut per_term {
@@ -315,6 +332,12 @@ impl<'a> ContextBuilder<'a> {
             .filter(|s| is_authored_symbol(s, query, &options.extra_keywords))
             .cloned()
             .collect();
+        // Nodes that arrived through exact-name or exact-source evidence, by
+        // id. The diagnostics tier derives `exact` from this provenance, not
+        // from the score: multiplicative boosts make the score bands overlap
+        // (a well-boosted lexical hit can clear EXACT_MATCH_SCORE, and a
+        // down-weighted exact match can fall below it).
+        let mut exact_ids: HashSet<String> = exact_source_ids.clone();
         if !exact_names.is_empty() {
             let exact_nodes = self
                 .db
@@ -324,6 +347,7 @@ impl<'a> ContextBuilder<'a> {
                 if excluded.contains(&node.id) {
                     continue;
                 }
+                exact_ids.insert(node.id.clone());
                 // Exact matches bypass the min_score gate by design. If the node
                 // already arrived via FTS (with a low score), upgrade it in place
                 // to the exact-match score rather than dropping the duplicate.
@@ -459,6 +483,37 @@ impl<'a> ContextBuilder<'a> {
         // boosts all re-sort). Apply diversity before the final root limit so
         // a large file's executable owner is still available to the cap.
         // --- Per-file diversity cap + final BFS root limit ---
+        // Best post-boost score and the id that holds it, captured before
+        // `candidates` is consumed by the partition below. The `exact` tier
+        // comes from provenance (`exact_ids`), never from the score: boosts
+        // make the bands overlap, so a score threshold would mislabel a
+        // well-boosted lexical hit as exact and a down-weighted exact match
+        // as merely strong. The score decides only strong versus fts-only —
+        // boosted negated-BM25 hits land in the ~5–30 band, so a strong
+        // match clears STRONG_MATCH_SCORE while weak lexical matches fall
+        // below it.
+        let best: Option<(&str, f64)> = candidates
+            .iter()
+            .map(|candidate| (candidate.node.id.as_str(), candidate.score))
+            .fold(None, |acc: Option<(&str, f64)>, (id, score)| match acc {
+                Some((_, top)) if top >= score => acc,
+                _ => Some((id, score)),
+            });
+        let best_score = best.map(|(_, score)| score);
+        let match_quality = best.map(|(id, score)| {
+            if exact_ids.contains(id) {
+                "exact".to_string()
+            } else if score >= STRONG_MATCH_SCORE {
+                "strong".to_string()
+            } else {
+                "fts-only".to_string()
+            }
+        });
+        let diagnostics = RetrievalDiagnostics {
+            term_hits,
+            best_score,
+            match_quality,
+        };
         let max_per_file = options.max_per_file.unwrap_or(options.max_nodes);
         // `search_limit` and per-file diversity bound ranked semantic BFS roots
         // (#120), but exact source hits are correctness-sensitive seeds rather
@@ -494,7 +549,7 @@ impl<'a> ContextBuilder<'a> {
             entry_points.len() <= options.max_nodes,
             "entry_points exceeds max_nodes"
         );
-        Ok(entry_points)
+        Ok((entry_points, diagnostics))
     }
 
     /// Finds the innermost indexed symbol enclosing each exact qualified
@@ -512,7 +567,9 @@ impl<'a> ContextBuilder<'a> {
             return Ok(Vec::new());
         }
 
-        let mut files = self.db.get_all_files().await?;
+        // Candidates are keyed by the nodes a file contains, so an artifact
+        // could never contribute one — scanning them would only cost I/O (#323).
+        let mut files = self.db.get_code_files().await?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut candidates: HashMap<String, SearchResult> = HashMap::new();
 
@@ -1104,6 +1161,58 @@ fn is_authored_symbol(symbol: &str, query: &str, extra_keywords: &[String]) -> b
 /// Extracts exact, namespace-qualified source tokens from the task and extra
 /// keywords. Surrounding prose punctuation and Markdown backticks are removed,
 /// but the original case is retained for case-sensitive literal matching.
+/// Shortest phrase accepted as exact-copy evidence. Two short words ("is not")
+/// would match half a codebase and turn the source scan into noise.
+const MIN_EXACT_PHRASE_LEN: usize = 8;
+
+/// Cap on phrase terms, so a keyword list can't make the source scan unbounded.
+const MAX_EXACT_PHRASES: usize = 8;
+
+/// Extracts multi-word phrases to be matched verbatim against file source.
+///
+/// A quoted phrase is the most specific evidence a caller can give — UI copy, a
+/// log line, an error message — and it is precisely what identifier extraction
+/// cannot represent, since it survives in the source as a string literal and
+/// nowhere in any symbol name. Left to FTS alone such a phrase loses: it may hit
+/// exactly one node in the codebase, but if that node is a large object literal
+/// (a localization catalog, say) BM25's length normalization scores the unique
+/// hit below hundreds of generic short matches, and the highest-signal evidence
+/// ranks last (#362).
+///
+/// Phrases come from two places: any caller-supplied keyword containing inner
+/// whitespace, and any double-quoted span in the task text. Single words are
+/// deliberately excluded — they are already handled by FTS, and scanning source
+/// for one common word would match everywhere.
+fn exact_phrase_terms(query: &str, extra_keywords: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut phrases = Vec::new();
+
+    let mut push = |candidate: &str, phrases: &mut Vec<String>| {
+        let phrase = candidate.trim();
+        if phrase.len() >= MIN_EXACT_PHRASE_LEN
+            && phrase.split_whitespace().count() >= 2
+            && seen.insert(phrase.to_string())
+        {
+            phrases.push(phrase.to_string());
+        }
+    };
+
+    for keyword in extra_keywords {
+        push(keyword, &mut phrases);
+    }
+    // Double-quoted spans in the task text: `"..."` pairs, in order.
+    let mut rest = query;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        push(&after[..close], &mut phrases);
+        rest = &after[close + 1..];
+    }
+
+    phrases.truncate(MAX_EXACT_PHRASES);
+    phrases
+}
+
 fn exact_source_terms(query: &str, extra_keywords: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     std::iter::once(query)
@@ -1436,6 +1545,72 @@ mod tests {
     }
 
     #[test]
+    fn exact_phrase_terms_takes_multiword_keywords_verbatim() {
+        // The whole point: a quoted phrase survives in source as a string
+        // literal and appears in no symbol name, so it must be matched as-is.
+        let terms = exact_phrase_terms(
+            "Diagnose the dashboard",
+            &["Waiting for status".to_string()],
+        );
+        assert_eq!(terms, vec!["Waiting for status".to_string()]);
+    }
+
+    #[test]
+    fn exact_phrase_terms_rejects_single_words_and_short_phrases() {
+        // A single common word would match everywhere; FTS already covers it.
+        let terms = exact_phrase_terms(
+            "no quotes here",
+            &["dashboard".to_string(), "status".to_string()],
+        );
+        assert!(
+            terms.is_empty(),
+            "single words must not trigger a source scan"
+        );
+
+        // Two very short words are no more specific than one.
+        let terms = exact_phrase_terms("x", &["is не".to_string(), "a b".to_string()]);
+        assert!(
+            terms.is_empty(),
+            "sub-minimum phrases must be rejected: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_extracts_quoted_spans_from_the_task() {
+        let terms = exact_phrase_terms(
+            r#"Why does it show "Waiting for status" instead of "Ready to go" now?"#,
+            &[],
+        );
+        assert_eq!(
+            terms,
+            vec!["Waiting for status".to_string(), "Ready to go".to_string()]
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_ignores_an_unclosed_quote() {
+        let terms = exact_phrase_terms(r#"look for "Waiting for status"#, &[]);
+        assert!(
+            terms.is_empty(),
+            "an unterminated quote must not scan: {terms:?}"
+        );
+    }
+
+    #[test]
+    fn exact_phrase_terms_dedupes_and_caps() {
+        // Same phrase from both the keyword list and the task text counts once.
+        let terms = exact_phrase_terms(
+            r#"see "Waiting for status" please"#,
+            &["Waiting for status".to_string()],
+        );
+        assert_eq!(terms.len(), 1);
+
+        // The source scan reads every file, so the term list must stay bounded.
+        let many: Vec<String> = (0..40).map(|i| format!("phrase number {i}")).collect();
+        assert_eq!(exact_phrase_terms("x", &many).len(), MAX_EXACT_PHRASES);
+    }
+
+    #[test]
     fn test_filters_stop_words() {
         let symbols = extract_symbols_from_query("the is in for to a an");
         assert!(symbols.is_empty());
@@ -1488,7 +1663,7 @@ mod tests {
         let terms = vec!["auth".to_string(), "handler".to_string()];
         apply_cooccurrence_boost(&mut candidates, &terms);
         // auth_handler matches both terms, user_list matches neither
-        assert!(candidates[0].node.name == "auth_handler");
+        assert_eq!(candidates[0].node.name, "auth_handler");
         assert!(candidates[0].score > candidates[1].score);
     }
 
@@ -1518,7 +1693,7 @@ mod tests {
             .filter(|n| n.file_path == "src/big.rs")
             .count();
         assert!(big_count <= 3); // 2 accepted + possibly 1 spillover
-        assert!(result.len() == 4);
+        assert_eq!(result.len(), 4);
         // First 2 slots for big.rs, 3rd for other.rs
         assert_eq!(result[0].name, "fn1");
         assert_eq!(result[1].name, "fn2");

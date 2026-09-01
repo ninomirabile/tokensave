@@ -6,6 +6,7 @@
 //! allowing AI assistants to query the code graph interactively.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 #[cfg(feature = "test-transport")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -19,7 +20,8 @@ use crate::global_db::GlobalDb;
 use crate::tokensave::TokenSave;
 
 use super::graph_scope::{
-    decode_selected_inputs, qualify_result, select_graph, validate_local_inputs, GraphSelector,
+    collapse_worktree_roots, decode_selected_inputs, merge_federated_results, qualify_result,
+    select_graph, validate_local_inputs, GraphSelector, FEDERATABLE_TOOLS,
 };
 use super::tools::{
     baseline_policy, cap_baseline, get_always_load_tool_definitions, get_tool_definitions,
@@ -27,6 +29,16 @@ use super::tools::{
     settle_session_debt,
 };
 use super::transport::{ErrorCode, JsonRpcRequest, JsonRpcResponse};
+
+/// Selector-less local graph tools refused after tracked-branch drift.
+pub(crate) const LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS: &[&str] = &[
+    "tokensave_affected",
+    "tokensave_diff_context",
+    "tokensave_simplify_scan",
+    "tokensave_redundancy",
+    "tokensave_diagnostics",
+    "tokensave_diagnose",
+];
 
 /// Runtime statistics for the MCP server.
 pub struct ServerStats {
@@ -49,6 +61,13 @@ impl ServerStats {
 
 /// Cache duration for version checks (15 minutes).
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_mins(15);
+
+/// How often a running server bothers to *consider* a worldwide-counter upload.
+///
+/// This is a re-entry guard, not the upload cadence: it only keeps a busy
+/// server from reading the user config on every tool call. Whether a request is
+/// actually made is `cloud::upload_is_due`, which is daily.
+const FLUSH_CHECK_INTERVAL_SECS: i64 = 30;
 
 /// Hand-maintained schema documentation for the `tokensave://schema` resource.
 /// Mirrors `src/db/migrations.rs::create_schema`. Update both together.
@@ -314,6 +333,10 @@ pub struct McpServer {
     last_flush_at: AtomicI64,
     /// User-level database tracking all projects (best-effort).
     global_db: Option<GlobalDb>,
+    /// Initialized projects sitting directly beside the served root, snapshotted
+    /// at startup and named in the `initialize` instructions so a session knows
+    /// which other graphs `graph_root` can reach (#375).
+    sibling_projects: Vec<String>,
     /// Cached latest-version check result.
     version_cache: std::sync::Mutex<VersionCheckState>,
     /// Pending JSON-RPC notifications to send before the next response.
@@ -366,6 +389,73 @@ pub struct McpServer {
     /// Number of spawned global-ledger persistence tasks still running.
     #[cfg(feature = "test-transport")]
     accounting_tasks_pending: Arc<AtomicUsize>,
+}
+
+/// Explains why an automatic sync declined to run, for the server's stderr.
+///
+/// Automatic syncs are the ones the user did not ask for, so a refusal has to
+/// say what was skipped and how to do it deliberately — silently serving a
+/// stale (or empty) index is the failure mode that made #396 and #393 hard to
+/// diagnose from the outside.
+fn auto_sync_refusal(scope: &crate::tokensave::AutoSyncScope) -> String {
+    match scope {
+        crate::tokensave::AutoSyncScope::Uninitialized => {
+            "skipping automatic sync: this project has no indexed files yet. \
+             Run `tokensave init` to build the index — a background sync will \
+             not index a project from scratch (#396)."
+                .to_string()
+        }
+        crate::tokensave::AutoSyncScope::BranchDrifted(drift) => format!(
+            "skipping automatic sync: this server is serving branch '{}' but the \
+             working tree is now on '{}'. Syncing would write '{}' files into \
+             '{}'s index. Restart the MCP server to pick up the branch (#400).",
+            drift.serving, drift.working_tree, drift.working_tree, drift.serving
+        ),
+        crate::tokensave::AutoSyncScope::TooManyStale { count, limit } => format!(
+            "skipping automatic sync: {count} files are stale, over the \
+             {limit}-file limit for a background sync. Run `tokensave sync` to \
+             index them, or raise `max_auto_sync_files` in .tokensave/config.json."
+        ),
+        // Not a refusal; kept total so a new variant cannot silently become
+        // an empty message.
+        crate::tokensave::AutoSyncScope::Sync(_) => "automatic sync proceeding".to_string(),
+    }
+}
+
+/// The deferral rule for [`McpServer::startup_work_in_flight`], as a pure
+/// function of the three flags so the truth table can be tested directly.
+///
+/// The asymmetry between the two jobs is deliberate. Startup catch-up is
+/// spawned unconditionally, so its `done` flag always settles and "not done"
+/// really does mean "still running". A version reindex may never be triggered
+/// at all, so it defers only while *started and not finished* — keying on
+/// `!done` alone would make every ordinary session defer forever and the
+/// option would silently do nothing.
+fn defer_idle_exit(catch_up_done: bool, reindex_started: bool, reindex_done: bool) -> bool {
+    !catch_up_done || (reindex_started && !reindex_done)
+}
+
+/// Sleep until `d` elapses, or never when there is no deadline.
+///
+/// Created fresh at each park, so the window always starts whole and never
+/// spans request handling.
+async fn idle_deadline(d: Option<std::time::Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Say why the server is leaving. An idle exit is indistinguishable from a
+/// crash in a host's log otherwise, and the whole point of the option is that
+/// an operator turned it on and wants to see it working.
+fn report_idle_exit(d: Option<std::time::Duration>) {
+    if let Some(d) = d {
+        eprintln!(
+            "[tokensave] idle for {}s with no request — exiting (--idle-timeout-secs)",
+            d.as_secs()
+        );
+    }
 }
 
 impl McpServer {
@@ -421,8 +511,13 @@ impl McpServer {
         let persisted = cg.get_tokens_saved().await.unwrap_or(0);
         let global_db = GlobalDb::open().await;
         // Register this project in the global DB with its current tokens
+        let mut sibling_projects = Vec::new();
         if let Some(ref gdb) = global_db {
             gdb.upsert(cg.project_root(), persisted).await;
+            // Snapshot the neighbouring graphs once, for the initialize
+            // instructions (#375). `tokensave_status` re-reads them live, so a
+            // project indexed later in the session is still discoverable.
+            sibling_projects = gdb.sibling_projects(cg.project_root()).await;
         }
 
         // Detect borrowed-worktree index once at startup so every read
@@ -456,6 +551,7 @@ impl McpServer {
             last_flushed_tokens: AtomicU64::new(persisted),
             last_flush_at: AtomicI64::new(0),
             global_db,
+            sibling_projects,
             version_cache: std::sync::Mutex::new(VersionCheckState {
                 latest: None,
                 checked_at: None,
@@ -478,9 +574,15 @@ impl McpServer {
 
         // Catch-up sync (#414): pick up changes made while the server
         // was down — terminal `git pull`, IDE edits before the agent
-        // launched, files touched by another tool. Detached + weak so
-        // it never extends the server's lifetime; non-blocking so MCP
-        // `initialize` doesn't wait on the walk.
+        // launched, files touched by another tool. Detached and holding
+        // only a `Weak`, so a server dropped before the task starts is
+        // not resurrected by it; non-blocking so MCP `initialize` doesn't
+        // wait on the walk. Note the upgrade below does hold a strong
+        // reference for the duration of the sync — the server cannot drop
+        // mid-sync — and nothing cancels an in-flight sync when the read
+        // loop exits (#396). The scope bound in `find_stale_files_bounded`
+        // caps how long that window can be; cooperative cancellation is
+        // tracked separately.
         {
             let weak = Arc::downgrade(&server);
             tokio::spawn(async move {
@@ -491,6 +593,194 @@ impl McpServer {
         }
 
         server
+    }
+
+    /// Tools that stay callable when strict mode refuses everything else.
+    ///
+    /// Refusing *every* tool would leave an agent unable to discover why it was
+    /// refused from inside the session that hit it. The exemption is deliberately
+    /// one tool: `tokensave_status` reports the server's own state — the root and
+    /// branch being served, whether a fallback is active — which is precisely
+    /// what a refused caller needs, and it reads no graph content, so it cannot
+    /// carry a wrong-tree answer.
+    ///
+    /// Three tools whose names suggest they belong here do not:
+    ///
+    /// - `tokensave_config` queries arbitrary TOML/JSON files by key path. It
+    ///   has nothing to do with tokensave's own configuration, and knowing a
+    ///   `Cargo.toml` value does not help diagnose a refusal.
+    /// - `tokensave_diagnose` maps `cargo check`/`clippy` output onto the
+    ///   smallest containing **graph node**, with callers attached.
+    /// - `tokensave_diagnostics` runs the type-checker and resolves each
+    ///   diagnostic's **enclosing graph node**.
+    ///
+    /// The last two are graph reads wearing diagnostic names: under a wrong-tree
+    /// index they would attribute a real compiler error to a node from another
+    /// tree, which is the exact failure strict mode exists to prevent.
+    const STRICT_MODE_DIAGNOSTIC_TOOLS: &'static [&'static str] = &["tokensave_status"];
+
+    /// Why this call must be refused under strict mode, or `None` to proceed.
+    ///
+    /// Strict mode (`strict_tree`, default off — #372 §2) turns the two
+    /// existing wrong-tree detections from advisory into refusals: a borrowed
+    /// worktree index (#312) and a branch that drifted under a running server
+    /// (#400). Nothing new is detected here; this only decides what a detection
+    /// does.
+    ///
+    /// The reporter's case for it: every tool built on tokensave inherits a
+    /// wrong-tree answer with no signal, and an empty result reads as "no such
+    /// symbol" rather than "wrong tree". The case for it staying opt-in: a
+    /// shared index across a family of worktrees is a legitimate setup, and
+    /// hard-erroring that would be a bad surprise in a point release.
+    ///
+    /// The message names both trees or branches and the setting responsible, so
+    /// the refusal is actionable without reading the docs.
+    fn strict_tree_refusal(&self, tool_name: &str) -> Option<String> {
+        if !self.cg.get_config().strict_tree {
+            return None;
+        }
+        if Self::STRICT_MODE_DIAGNOSTIC_TOOLS.contains(&tool_name) {
+            return None;
+        }
+
+        if let Some(m) = &self.worktree_mismatch {
+            return Some(format!(
+                "refusing: strict_tree is enabled and this index belongs to a different git \
+                 working tree. Running in '{}', index from '{}'. Run `tokensave init` here for \
+                 a worktree-local index, or set strict_tree to false to answer with a warning \
+                 instead.",
+                m.worktree_root.display(),
+                m.index_root.display()
+            ));
+        }
+
+        // Re-checked per call, unlike the worktree mismatch above: drift is
+        // caused by a `git checkout` during the session, so a value computed
+        // at startup would always report none.
+        if let Some(drift) = self.cg.branch_drift() {
+            return Some(format!(
+                "refusing: strict_tree is enabled and this server is serving branch '{}' while \
+                 the working tree is on '{}'. Restart the MCP server to serve this branch, or \
+                 set strict_tree to false to answer with a warning instead.",
+                drift.serving, drift.working_tree
+            ));
+        }
+
+        None
+    }
+
+    /// Refuse local graph calls when a live multi-branch server has drifted.
+    ///
+    /// Checked per call (a `git checkout` under a running server is what
+    /// drifts), before freshness work and dispatch, and only for local graph
+    /// tools: `tokensave_status` stays callable for diagnosis, tools without
+    /// graph reads are unaffected, and explicit external `graph_root`
+    /// selections never reach this gate.
+    fn branch_drift_refusal(&self, tool_name: &str) -> Option<String> {
+        if tool_name == "tokensave_status"
+            || (!self.graph_scoped_tools.contains(tool_name)
+                && !LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS.contains(&tool_name))
+        {
+            return None;
+        }
+
+        let drift = self.cg.branch_drift()?;
+        Some(format!(
+            "refusing: MCP server serves branch '{}' while the working tree is on '{}'. \
+             Restart the MCP server to serve this branch, or reopen it for the working branch.",
+            drift.serving, drift.working_tree
+        ))
+    }
+
+    /// Answers one query across several `graph_root`s (#376).
+    ///
+    /// Runs the ordinary selected-graph pipeline once per root — open, decode
+    /// inputs, dispatch, qualify — then interleaves the per-root payloads
+    /// round-robin by rank. Scores are BM25-derived per database and are not
+    /// calibrated between them, so sorting them together would compare numbers
+    /// that do not share a scale; rank is the only ordering both roots agree on.
+    ///
+    /// Roots that are worktrees of a repository already named are collapsed
+    /// first, and the response says which and why. Without that, a caller with
+    /// a repo and its worktrees among their roots gets a result set full of the
+    /// same symbol at slightly different line numbers, and a per-root cap does
+    /// not help because each worktree is its own root.
+    ///
+    /// A root that fails to open is reported inline rather than failing the
+    /// whole call: with several roots named, one unreadable index should not
+    /// cost the caller the answers from the others.
+    async fn handle_federated_call(
+        self: &Arc<Self>,
+        id: Value,
+        tool_name: &str,
+        arguments: &Value,
+        selection: &super::graph_scope::GraphSelection,
+    ) -> JsonRpcResponse {
+        let (kept, collapsed) = collapse_worktree_roots(selection.roots.clone());
+        let branch = selection.branch.clone();
+
+        let mut parts: Vec<(String, crate::mcp::tools::ToolResult)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+
+        for root in kept {
+            let selector = GraphSelector {
+                root: root.clone(),
+                branch: branch.clone(),
+            };
+            let selected = match select_graph(selector, self.cg.project_root()).await {
+                Ok(selected) => selected,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", root.display()));
+                    continue;
+                }
+            };
+            let mut root_args = arguments.clone();
+            if let Err(error) = decode_selected_inputs(&selected, &mut root_args) {
+                failures.push(format!("{}: {error}", root.display()));
+                continue;
+            }
+            let outcome = handle_tool_call(&selected.cg, tool_name, root_args, None, None).await;
+            let mut result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", root.display()));
+                    continue;
+                }
+            };
+            if let Err(error) = qualify_result(&selected, &mut result).await {
+                failures.push(format!("{}: {error}", root.display()));
+                continue;
+            }
+            parts.push((selected.provenance_root.clone(), result));
+        }
+
+        if parts.is_empty() {
+            return JsonRpcResponse::error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("no graph_root could be queried: {}", failures.join("; ")),
+            );
+        }
+
+        let mut merged = merge_federated_results(parts, &collapsed);
+        if !failures.is_empty() {
+            if let Some(content) = merged
+                .value
+                .get_mut("content")
+                .and_then(|c| c.as_array_mut())
+            {
+                content.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "WARNING: {} root(s) could not be queried and are absent from these \
+                         results: {}",
+                        failures.len(),
+                        failures.join("; ")
+                    )
+                }));
+            }
+        }
+        JsonRpcResponse::success(id, merged.value)
     }
 
     /// Returns the active scope prefix, if the server was launched from a subdirectory.
@@ -608,7 +898,14 @@ impl McpServer {
     /// The completion flag is flipped on every exit path (including
     /// errors) so [`Self::wait_for_startup_catch_up`] never hangs.
     pub async fn run_startup_catch_up_sync(&self) {
-        let stale = self.cg.find_stale_files().await;
+        let stale = match self.cg.find_stale_files_bounded().await {
+            crate::tokensave::AutoSyncScope::Sync(stale) => stale,
+            scope => {
+                eprintln!("[tokensave] {}", auto_sync_refusal(&scope));
+                self.startup_catch_up_done.store(true, Ordering::Release);
+                return;
+            }
+        };
         if !stale.is_empty() {
             if let Err(e) = self.cg.sync_if_stale_silent(&stale).await {
                 eprintln!("[tokensave] startup catch-up sync failed: {e}");
@@ -683,7 +980,13 @@ impl McpServer {
             return;
         }
 
-        let stale = self.cg.find_stale_files().await;
+        let stale = match self.cg.find_stale_files_bounded().await {
+            crate::tokensave::AutoSyncScope::Sync(stale) => stale,
+            scope => {
+                eprintln!("[tokensave] {}", auto_sync_refusal(&scope));
+                return;
+            }
+        };
         if !stale.is_empty() {
             if let Err(e) = self.cg.sync_if_stale_silent(&stale).await {
                 eprintln!("[tokensave] lazy sync failed: {e}");
@@ -843,15 +1146,26 @@ impl McpServer {
             .unwrap_or_default()
     }
 
-    /// Flushes pending tokens to the worldwide counter if at least 30 seconds
-    /// have elapsed since the last flush. Best-effort, never blocks for long.
+    /// Uploads the accumulated saved-token delta to the worldwide counter, at
+    /// most once a day. Best-effort, never blocks for long.
+    ///
+    /// Two gates, doing different jobs. The in-process one keeps a busy server
+    /// from loading the user config on every single tool call; the daily one in
+    /// `cloud::upload_is_due` decides whether a request is actually made, and is
+    /// shared with the CLI so both cadences are the same decision.
+    ///
+    /// Nothing is lost by declining to upload: `last_flushed_tokens` advances
+    /// only on success, so the delta is re-derived from the running total next
+    /// time. That is also why the accumulated total is not *persisted* when the
+    /// upload is skipped — writing it while `last_flushed_tokens` stays put
+    /// would count the same tokens twice.
     async fn maybe_flush_worldwide(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let last = self.last_flush_at.load(Ordering::Relaxed);
-        if now - last < 30 {
+        if now - last < FLUSH_CHECK_INTERVAL_SECS {
             return;
         }
         // Mark as attempted immediately to prevent re-entry.
@@ -867,13 +1181,14 @@ impl McpServer {
         let success = tokio::task::spawn_blocking(move || {
             let mut config = crate::user_config::UserConfig::load();
             config.pending_upload += delta;
-            if config.upload_enabled && crate::cloud::flush_pending(config.pending_upload).is_some()
-            {
+            if !crate::cloud::upload_is_due(&config, now) {
+                // Deliberately not saved: see the note above on double counting.
+                return false;
+            }
+            config.last_flush_attempt_at = now;
+            if crate::cloud::flush_pending(config.pending_upload).is_some() {
                 config.pending_upload = 0;
-                config.last_upload_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                config.last_upload_at = now;
                 config.save();
                 return true;
             }
@@ -972,29 +1287,112 @@ impl McpServer {
         self: &Arc<Self>,
         transport: &mut impl super::transport::McpTransport,
     ) -> Result<()> {
+        self.run_with_idle_timeout(transport, None).await
+    }
+
+    /// Is a detached startup job still running?
+    ///
+    /// The idle deadline must not cut one of these off. Both are spawned
+    /// rather than awaited, so a server can look idle — no request in flight,
+    /// nothing on stdin — while it is still doing the work a client is about
+    /// to depend on. Startup catch-up is always spawned, so its `done` flag
+    /// settles either way; the version reindex is checked as
+    /// started-and-not-finished, because a session that never triggers one
+    /// must not be treated as forever busy.
+    fn startup_work_in_flight(&self) -> bool {
+        defer_idle_exit(
+            self.startup_catch_up_done.load(Ordering::Acquire),
+            self.version_reindex_started.load(Ordering::Acquire),
+            self.version_reindex_done.load(Ordering::Acquire),
+        )
+    }
+
+    /// Run the MCP loop, optionally exiting after `idle_timeout` passes with
+    /// no request (#436).
+    ///
+    /// A host that keeps a finished subagent's server alive never closes its
+    /// stdin, so the EOF that would normally stop the server never arrives and
+    /// one server accumulates per subagent, each holding its index open. That
+    /// is the host's bug to fix — the servers are all children of the same
+    /// still-live supervisor, so there is no dead-parent signal to key on
+    /// either — but a deadline bounds the damage without waiting for it.
+    ///
+    /// Off unless asked for. Whether this is safe depends on the host starting
+    /// a fresh server when a tool is called after an idle exit, which varies by
+    /// host and is not something tokensave can detect, so the default stays
+    /// today's indefinite lifetime.
+    ///
+    /// The deadline is evaluated **only** while parked waiting for the next
+    /// line, never during request handling: the timer is created fresh each
+    /// time the loop parks, so a request that takes longer than the timeout
+    /// cannot be interrupted by it, and the window after it starts whole.
+    /// Requests are handled serially, so no in-flight counter is needed.
+    pub async fn run_with_idle_timeout(
+        self: &Arc<Self>,
+        transport: &mut impl super::transport::McpTransport,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
         let already_started = self.run_started.swap(true, Ordering::Relaxed);
         debug_assert!(
             !already_started,
             "server run() called on an already-used server"
         );
 
-        loop {
-            let line: String = {
+        // Registered once, for the life of the loop, rather than per
+        // iteration (#450/#436).
+        //
+        // Creating the stream inside the loop meant it existed only while
+        // `select!` awaited the next line, and was dropped before
+        // `handle_request` ran. Tokio's registration is process-global and is
+        // *not* undone on drop, so the default disposition — terminate — was
+        // permanently replaced after the first iteration, while for most of a
+        // busy server's life nothing was listening. A SIGTERM delivered during
+        // request handling therefore neither killed the process nor reached
+        // the loop: the next iteration built a fresh stream, which cannot see
+        // an event delivered before it existed. That is the reported
+        // behaviour, a server that ignores `kill` and needs `SIGKILL`.
+        //
+        // Held across the whole loop, the stream coalesces and retains a
+        // signal delivered while it is not being polled, so a SIGTERM arriving
+        // mid-request is observed at the top of the next iteration and the
+        // server leaves through the normal graceful shutdown. Note this waits
+        // for the in-flight request to finish; interrupting a long sync
+        // mid-flight is a separate decision, tracked on #450.
+        #[cfg(unix)]
+        #[allow(clippy::expect_used)]
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
+        'serve: loop {
+            // The inner loop exists only so a deferred idle expiry can re-arm:
+            // a deadline that lands while a detached startup job is still
+            // running is not evidence the server is finished with, so it waits
+            // out another whole window rather than exiting or being ignored.
+            let line: String = 'wait: loop {
                 #[cfg(unix)]
                 {
-                    #[allow(clippy::expect_used)]
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("failed to register SIGTERM handler");
                     tokio::select! {
                         result = transport.read_line() => {
                             match result {
-                                Ok(Some(line)) => line,
-                                _ => break,
+                                Ok(Some(line)) => break 'wait line,
+                                _ => break 'serve,
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => break,
-                        _ = sigterm.recv() => break,
+                        _ = tokio::signal::ctrl_c() => break 'serve,
+                        _ = sigterm.recv() => break 'serve,
+                        // Set by the process-wide handler in `cancel`, which
+                        // observes a signal the moment it lands rather than
+                        // only while this loop is parked here — and by the
+                        // orphan watchdog, which has no signal to deliver at
+                        // all (#450).
+                        () = crate::cancel::cancelled() => break 'serve,
+                        () = idle_deadline(idle_timeout) => {
+                            if self.startup_work_in_flight() {
+                                continue 'wait;
+                            }
+                            report_idle_exit(idle_timeout);
+                            break 'serve;
+                        }
                     }
                 }
                 #[cfg(not(unix))]
@@ -1002,11 +1400,19 @@ impl McpServer {
                     tokio::select! {
                         result = transport.read_line() => {
                             match result {
-                                Ok(Some(line)) => line,
-                                _ => break,
+                                Ok(Some(line)) => break 'wait line,
+                                _ => break 'serve,
                             }
                         }
-                        _ = tokio::signal::ctrl_c() => break,
+                        _ = tokio::signal::ctrl_c() => break 'serve,
+                        () = crate::cancel::cancelled() => break 'serve,
+                        () = idle_deadline(idle_timeout) => {
+                            if self.startup_work_in_flight() {
+                                continue 'wait;
+                            }
+                            report_idle_exit(idle_timeout);
+                            break 'serve;
+                        }
                     }
                 }
             };
@@ -1055,11 +1461,11 @@ impl McpServer {
                 let output = format!("{json_line}\n");
                 if let Err(e) = transport.write_line(&output).await {
                     eprintln!("failed to write response: {e}");
-                    break;
+                    break 'serve;
                 }
                 if let Err(e) = transport.flush().await {
                     eprintln!("failed to flush stdout: {e}");
-                    break;
+                    break 'serve;
                 }
             }
         }
@@ -1095,19 +1501,24 @@ impl McpServer {
             gdb.checkpoint().await;
         }
 
-        // Flush remaining delta to worldwide counter (what periodic flushes missed)
+        // Record the remaining delta the periodic flushes did not upload, and
+        // upload it only if a day has passed. Unlike the periodic path this
+        // always *persists* the accumulated total: the process is ending, so
+        // `last_flushed_tokens` is about to be lost and the config file is the
+        // only thing that will still remember these tokens.
         let last_flushed = self.last_flushed_tokens.load(Ordering::Relaxed);
         if tokens_saved > last_flushed {
             let delta = tokens_saved - last_flushed;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             let mut config = crate::user_config::UserConfig::load();
             config.pending_upload += delta;
-            if config.upload_enabled {
-                if let Some(_total) = crate::cloud::flush_pending(config.pending_upload) {
+            if crate::cloud::upload_is_due(&config, now) {
+                config.last_flush_attempt_at = now;
+                if crate::cloud::flush_pending(config.pending_upload).is_some() {
                     config.pending_upload = 0;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
                     config.last_upload_at = now;
                 }
             }
@@ -1142,7 +1553,11 @@ impl McpServer {
         let id = request.id.clone();
 
         let result = match request.method.as_str() {
-            "initialize" => Some(Self::handle_initialize(id)),
+            "initialize" => Some(Self::handle_initialize(
+                id,
+                self.cg.report_savings(),
+                &self.sibling_projects,
+            )),
             "initialized" => {
                 // Notification - no response required
                 None
@@ -1177,7 +1592,46 @@ impl McpServer {
     }
 
     /// Handles the `initialize` method, returning server capabilities.
-    fn handle_initialize(id: Value) -> JsonRpcResponse {
+    ///
+    /// `report_savings` gates the closing sentence only. Asking the agent to
+    /// report savings makes it spend output tokens narrating them on nearly
+    /// every turn, which for some users offsets the input-token win the server
+    /// exists to deliver (#356); when the setting is off the sentence is
+    /// omitted, and `handle_tools_call` correspondingly stops appending the
+    /// `tokensave_metrics:` line it refers to.
+    fn handle_initialize(
+        id: Value,
+        report_savings: bool,
+        sibling_projects: &[String],
+    ) -> JsonRpcResponse {
+        const BASE_INSTRUCTIONS: &str = "tokensave is a code-graph MCP server. \
+            Start with tokensave_context for any code exploration task \
+            — it returns relevant symbols, relationships, and code \
+            snippets for a natural-language query. Use tokensave_search \
+            to find specific symbols by name. Discovery and analysis \
+            tools are read-only and safe to call in parallel. Edit \
+            and session-memory tools can mutate local project state \
+            and declare readOnlyHint=false.";
+        const REPORT_SAVINGS_INSTRUCTION: &str =
+            " When a tool result contains a `tokensave_metrics:` line, \
+             report the savings to the user (e.g. 'TokenSave'd ~N tokens').";
+
+        let mut instructions = BASE_INSTRUCTIONS.to_string();
+        if report_savings {
+            instructions.push_str(REPORT_SAVINGS_INSTRUCTION);
+        }
+        // Sibling checkouts are queryable through `graph_root` but nothing else
+        // reveals that they exist, so a cross-repo session reads an empty result
+        // as "no such symbol" instead of retrying next door (#375).
+        if !sibling_projects.is_empty() {
+            let _ = write!(
+                instructions,
+                " These other initialized projects sit beside this one and can be \
+                 queried by passing graph_root: {}.",
+                sibling_projects.join(", ")
+            );
+        }
+
         JsonRpcResponse::success(
             id,
             json!({
@@ -1191,16 +1645,7 @@ impl McpServer {
                     "name": "tokensave",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "tokensave is a code-graph MCP server. \
-                    Start with tokensave_context for any code exploration task \
-                    — it returns relevant symbols, relationships, and code \
-                    snippets for a natural-language query. Use tokensave_search \
-                    to find specific symbols by name. Discovery and analysis \
-                    tools are read-only and safe to call in parallel. Edit \
-                    and session-memory tools can mutate local project state \
-                    and declare readOnlyHint=false. \
-                    When a tool result contains a `tokensave_metrics:` line, \
-                    report the savings to the user (e.g. 'TokenSave\\'d ~N tokens')."
+                "instructions": instructions
             }),
         )
     }
@@ -1518,9 +1963,9 @@ impl McpServer {
             );
         }
 
-        let selected = if has_selector {
-            let selector = match GraphSelector::take(&mut arguments) {
-                Ok(Some(selector)) => selector,
+        let selection = if has_selector {
+            match GraphSelector::take(&mut arguments) {
+                Ok(Some(selection)) => Some(selection),
                 Ok(None) => unreachable!("has_selector guarantees a selector field"),
                 Err(error) => {
                     return JsonRpcResponse::error(
@@ -1529,7 +1974,41 @@ impl McpServer {
                         format!("invalid graph selector: {error}"),
                     );
                 }
-            };
+            }
+        } else {
+            None
+        };
+
+        // Federation (#376). Handled before the single-graph pipeline because
+        // it runs that pipeline once per root and merges. Selected calls are
+        // already outside savings accounting (#363), so an early return here
+        // loses nothing a single-root selected call would have recorded.
+        if let Some(selection) = selection.as_ref() {
+            if selection.is_federated() {
+                if !FEDERATABLE_TOOLS.contains(&tool_name) {
+                    return JsonRpcResponse::error(
+                        id,
+                        ErrorCode::InvalidParams,
+                        format!(
+                            "tool '{tool_name}' answers about a single graph, so it accepts one \
+                             graph_root rather than an array; a union of two graphs is not a \
+                             larger answer. Federation is available for: {}",
+                            FEDERATABLE_TOOLS.join(", ")
+                        ),
+                    );
+                }
+                return self
+                    .handle_federated_call(id, tool_name, &arguments, selection)
+                    .await;
+            }
+        }
+
+        let selected = if let Some(selection) = selection {
+            let selector = selection
+                .selectors()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("a selection always names at least one root"));
             let selected = match select_graph(selector, self.cg.project_root()).await {
                 Ok(selected) => selected,
                 Err(TokenSaveError::Config { message }) => {
@@ -1567,6 +2046,19 @@ impl McpServer {
         };
 
         if selected.is_none() {
+            if let Some(reason) = self.branch_drift_refusal(tool_name) {
+                return JsonRpcResponse::error(id, ErrorCode::InvalidRequest, reason);
+            }
+
+            // Strict mode (#372 §2): refuse rather than answer from a tree the
+            // user is not in. Checked before freshness and before dispatch, so
+            // a refused call does no work. Selected graphs are exempt — naming
+            // `graph_root` is an explicit request for another project's
+            // snapshot, so "this isn't your working tree" is the point.
+            if let Some(reason) = self.strict_tree_refusal(tool_name) {
+                return JsonRpcResponse::error(id, ErrorCode::InvalidRequest, reason);
+            }
+
             // Notification-free freshness: walk the local tree and resync any
             // stale files, gated by a 30 s cooldown. Explicitly selected
             // graphs are read-only snapshots and never run local repair.
@@ -1807,6 +2299,29 @@ impl McpServer {
                     }
                 }
 
+                // Branch drift (#400). Unlike the worktree mismatch above,
+                // this is re-checked per call rather than cached at startup:
+                // it is caused by a `git checkout` *during* the session, so a
+                // value computed once would always say "no drift". Same
+                // failure shape though — answers about a tree the user is not
+                // in — so it rides the same channel.
+                if let Some(drift) = self.cg.branch_drift() {
+                    let notice = format!(
+                        "WARNING: tokensave results below come from branch '{}', but your \
+                         working tree is on '{}' — symbols that exist only on '{}' are \
+                         missing, and symbols shown may not exist on it. Restart the MCP \
+                         server to serve this branch.",
+                        drift.serving, drift.working_tree, drift.working_tree
+                    );
+                    if let Some(content) = result
+                        .value
+                        .get_mut("content")
+                        .and_then(|c| c.as_array_mut())
+                    {
+                        content.insert(0, json!({"type": "text", "text": notice}));
+                    }
+                }
+
                 // Every warning/banner above has now been attached to
                 // `content` — re-measure the *whole* response so `after`
                 // reflects what the model actually receives, not just the
@@ -1891,7 +2406,13 @@ impl McpServer {
                 // `before == 0` call invisible in both the response and
                 // what's persisted. One shared bool drives both decisions so
                 // they can't drift apart again.
-                let emit_metrics_line = before_tokens > 0;
+                // `report_savings = false` suppresses the line outright (#356).
+                // It flows through the same bool as the `before_tokens > 0`
+                // case, so the line's own token cost is not charged for a line
+                // that was never sent — and accounting to the global DB below
+                // is deliberately left outside this gate, so `tokensave gain`
+                // still sees every call.
+                let emit_metrics_line = before_tokens > 0 && self.cg.report_savings();
                 let render_metrics = |before: u64, after: u64, saved: u64| -> String {
                     format!("\ntokensave_metrics: before={before} after={after} saved={saved}")
                 };
@@ -2096,5 +2617,40 @@ mod staleness_banner_tests {
         assert!(!warning.contains('`'));
         assert!(!warning.contains("tokensave branch add"));
         assert!(!warning.contains("tokensave sync --path"));
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::defer_idle_exit;
+
+    /// Startup catch-up is spawned unconditionally, so "not done" means it is
+    /// genuinely still walking the tree — and cutting that off would abandon
+    /// work the next client request depends on.
+    #[test]
+    fn a_running_startup_catch_up_defers_the_exit() {
+        assert!(defer_idle_exit(false, false, false));
+        assert!(defer_idle_exit(false, true, true));
+    }
+
+    /// The case that would have made the whole option a no-op: a session that
+    /// never triggers a version reindex leaves `reindex_done` false forever, so
+    /// keying on that alone would defer every expiry on every server.
+    #[test]
+    fn a_reindex_that_never_started_does_not_defer_forever() {
+        assert!(
+            !defer_idle_exit(true, false, false),
+            "an ordinary idle server must be allowed to exit"
+        );
+    }
+
+    #[test]
+    fn a_running_version_reindex_defers_the_exit() {
+        assert!(defer_idle_exit(true, true, false));
+    }
+
+    #[test]
+    fn a_finished_reindex_stops_deferring() {
+        assert!(!defer_idle_exit(true, true, true));
     }
 }

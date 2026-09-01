@@ -21,6 +21,9 @@
   <img src="https://img.shields.io/badge/Linux-supported-blue.svg" alt="Linux">
   <img src="https://img.shields.io/badge/Windows-supported-blue.svg" alt="Windows">
   <a href="https://hypercommit.com/tokensave"><img src="https://img.shields.io/badge/Hypercommit-DB2475" alt="Hypercommit"></a>
+  <!-- Listing badge only. Deliberately not wrapped in a link: the badge's own
+       href points at a monetization page on the marketplace's side (#406). -->
+  <img src="https://getlulu.dev/api/mcps/badge/tokensave" alt="Listed in the Lulu MCP marketplace">
 </p>
 
 ---
@@ -75,7 +78,7 @@ AI coding agents waste tokens exploring codebases. Every grep, glob, and file re
 | **Smart Context Building** | **Semantic Search** | **Impact Analysis** |
 | One tool call returns everything the agent needs -- entry points, related symbols, and code snippets. | Find code by meaning, not just text. Search for "authentication" and find `login`, `validateToken`, `AuthService`. | Know exactly what breaks before you change it. Trace callers, callees, and the full impact radius of any symbol. |
 | **80+ MCP Tools** | **50+ Languages** | **12+ Agent Integrations** |
-| From call graph traversal to dead code detection, atomic edit primitives, code-health metrics, test mapping, and complexity analysis. | Rust, Go, Java, Python, TypeScript, C, C++, Swift, Svelte, Astro, and 43 more including WGSL/HLSL/Metal shaders, CUDA/HIP, and Markdown. Three tiers (lite/medium/full) control binary size. | Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kiro, Cursor, OpenCode, Copilot, Cline, Roo Code, Zed, Antigravity, Kilo CLI, Kimi CLI, Mistral Vibe, Grok Build, Factory Droid, Pi, Plank. |
+| From call graph traversal to dead code detection, atomic edit primitives, code-health metrics, test mapping, and complexity analysis. | Rust, Go, Java, Python, TypeScript, C, C++, Swift, Svelte, Astro, and 43 more including WGSL/HLSL/Metal shaders, CUDA/HIP, and Markdown. Three tiers (lite/medium/full) control binary size. | Claude Code, Codex CLI, Gemini CLI, Qwen Code, Kiro, Cursor, OpenCode, Copilot, Cline, Roo Code, Zed, Antigravity, Kilo CLI, Kimi CLI, Mistral Vibe, Grok Build, Factory Droid, OMP, Pi, Plank. |
 | **Multi-Branch Indexing (opt-in)** | **100% Local** | **Always Fresh** |
 | Optional per-branch databases. Cross-branch diff and search without switching your checkout. | No data leaves your machine. No API keys. No external services. Everything runs on a local libSQL database. | On-demand staleness check on every MCP call (30 s cooldown) plus catch-up sync when the server connects. Multi-agent work is expected to use git worktrees — each agent gets its own checkout and the index diverges are merged by git, not by a file watcher. |
 | **Subprocess-Isolated Extraction** | **Code-Health Analytics** | **Atomic Edit Primitives** |
@@ -135,6 +138,7 @@ tokensave install --agent gemini          # Gemini CLI
 tokensave install --agent kilo            # Kilo CLI
 tokensave install --agent kiro            # AWS Kiro
 tokensave install --agent kimi            # Moonshot Kimi CLI
+tokensave install --agent omp             # Oh My Pi (OMP)
 tokensave install --agent opencode        # OpenCode
 tokensave install --agent pi              # Pi (pi.dev)
 tokensave install --agent plank           # Plank (macOS only)
@@ -145,11 +149,15 @@ tokensave install --agent zed             # Zed
 tokensave install --agent grok            # Grok Build (xAI)
 tokensave install --git-hook yes           # auto-install the global post-commit and post-checkout hooks (no prompt)
 tokensave install --git-hook no            # skip the post-commit and post-checkout hooks (no prompt)
+tokensave githooks                         # show which global git hooks tokensave owns
+tokensave githooks off                     # remove them, leaving any hook content you wrote
 ```
 
 Each agent gets its MCP server registered in the native config format. Claude Code additionally gets a PreToolUse hook (blocks wasteful Explore agents), a UserPromptSubmit hook, a Stop hook, prompt rules in CLAUDE.md, and auto-allowed tool permissions. Kiro gets global MCP config, `tokensave.md` steering loaded as a resource, and a tokensave-managed default agent with permissive built-in/tokensave tool approval, delegation guardrail hooks, and post-write sync; user-managed Kiro agents are preserved.
 
-All changes are idempotent -- safe to run again after upgrading. After agent setup, you'll be offered global git post-commit and post-checkout hooks.
+Global OMP installs target the profile reported by bare `omp config path`, writing `<resolved-agent-dir>/mcp.json` and `<resolved-agent-dir>/rules/tokensave.md`. Export `OMP_PROFILE` or OMP's compatible `PI_PROFILE` when installing into a named profile; OMP's resolver also honors `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR`. Tokensave trusts that native resolver rather than duplicating OMP's profile logic. Tokensave installs MCP and advisory rules for OMP; it does not install OMP hook enforcement.
+
+All changes are idempotent -- safe to run again after upgrading. After agent setup, you'll be offered global git post-commit and post-checkout hooks. `tokensave uninstall` removes those hooks along with the agent integrations; pass `--keep-git-hooks` to leave them, or manage them on their own with `tokensave githooks`.
 
 ### Project-local install
 
@@ -157,9 +165,10 @@ By default `tokensave install` registers the MCP server in your **global** agent
 
 ```bash
 tokensave install --local --agent claude
+tokensave install --local --agent omp
 ```
 
-This writes project-scoped config you can commit and share with your team. For Claude that's `./.mcp.json`, `./.claude/settings.json`, and `./CLAUDE.md`. Supported agents: **claude, cursor, droid, gemini, zed, opencode, roo-code, kiro, auggie, plank** (each writes its own project file, e.g. `.cursor/mcp.json`, `.factory/mcp.json`, `.gemini/settings.json`, `.zed/settings.json`, `opencode.json`, `.roo/mcp.json`, `.kiro/settings/mcp.json`, `.augment/settings.json`, `.mcp.json` for plank). Other agents have no project-scoped config and report an error with `--local`.
+This writes project-scoped config you can commit and share with your team. For Claude that's `./.mcp.json`, `./.claude/settings.json`, and `./CLAUDE.md`; OMP uses `./.omp/mcp.json` and `./.omp/rules/tokensave.md` without invoking the OMP CLI. Supported agents: **claude, cursor, droid, gemini, zed, opencode, roo-code, kiro, auggie, omp, plank** (each writes its own project file, e.g. `.cursor/mcp.json`, `.factory/mcp.json`, `.gemini/settings.json`, `.zed/settings.json`, `opencode.json`, `.roo/mcp.json`, `.kiro/settings/mcp.json`, `.augment/settings.json`, `.omp/mcp.json`, `.mcp.json` for plank). Other agents have no project-scoped config and report an error with `--local`.
 
 Remove a project-local install with `tokensave uninstall --local`.
 
@@ -190,11 +199,11 @@ This creates a `.tokensave/` directory with the knowledge graph database. Initia
 
 #### PreToolUse hook
 
-The hook runs `tokensave hook-pre-tool-use` -- a native Rust command (no bash or jq required). It intercepts Agent, Grep, and Bash tool calls: Explore agents are blocked outright, and symbol-shaped grep/rg/ag invocations (plain identifiers, alternations, `\b`-wrapped names) are redirected to the matching tokensave MCP tool. Regex patterns, file-discovery modes, `git grep`, and piped commands pass through untouched; set `TOKENSAVE_DISABLE_GREP_HOOK=1` to opt out per shell.
+The hook runs `tokensave hook-pre-tool-use` -- a native Rust command (no bash or jq required). It intercepts Agent, Grep, Glob, and Bash tool calls: Explore agents are blocked outright, symbol-shaped grep/rg/ag invocations (plain identifiers, alternations, `\b`-wrapped names) are redirected to the matching tokensave MCP tool, and path-shaped discovery (`Glob`, `find -name`, `fd --extension`) over code extensions is redirected to `tokensave_files`. Regex patterns, `git grep`, piped commands, non-code extensions, search roots outside the index, and `find` predicates that change what the command does (`-exec`, `-delete`, `-mtime`) all pass through untouched; set `TOKENSAVE_DISABLE_GREP_HOOK=1` to opt out per shell.
 
 Filters are read most-specific-first: an explicit `type` is authoritative, then an explicit file glob, then the search path. A documentation search such as `path: "."` with `glob: "**/*.md"` therefore passes through rather than being treated as a code search on the broad path, while a code-only glob (`**/*.rs`) still redirects even under a non-code path. Mixed globs (`**/*.{rs,md}`) pass through, since they can return documentation.
 
-**Headless / subagent dispatch (`claude -p`).** Child processes dispatched by an orchestrating session inherit its `~/.claude/settings.json`, including this hook. To let a child run raw searches, set `TOKENSAVE_DISABLE_GREP_HOOK=1` in the child's environment -- the native binary honors it and passes every path (Grep, Bash, Agent) through, so there is no need for the blunt `--settings '{"hooks": {}}'` that strips *all* hooks. The guardrail is stateless: it never consults citation history, so it only ever redirects the symbol-shaped searches described above and steers untyped research fan-out; ordinary commands are unaffected whether the session is interactive or headless.
+**Headless / subagent dispatch (`claude -p`).** Child processes dispatched by an orchestrating session inherit its `~/.claude/settings.json`, including this hook. To let a child run raw searches, set `TOKENSAVE_DISABLE_GREP_HOOK=1` in the child's environment -- the native binary honors it and passes every path (Grep, Glob, Bash, Agent) through, so there is no need for the blunt `--settings '{"hooks": {}}'` that strips *all* hooks. The guardrail is stateless: it never consults citation history, so it only ever redirects the symbol-shaped searches described above and steers untyped research fan-out; ordinary commands are unaffected whether the session is interactive or headless.
 
 #### CLAUDE.md rules
 
@@ -248,11 +257,11 @@ When the MCP server can't find a database for the current branch, it serves from
 
 Once multi-branch mode is bootstrapped (a first manual `tokensave branch add` created the branch metadata), new branches can be tracked automatically instead of falling back to the ancestor DB. Two independent mechanisms cover this; projects in single-DB mode are never affected, and neither mechanism ever touches the default branch's database.
 
-**Git hook (on branch checkout).** The `post-checkout` hook that `tokensave install` sets up recognizes a *branch* checkout (as opposed to a file checkout) and runs `tokensave branch add` in the background. That command is a no-op when the branch is already tracked or is the default branch, so ordinary switching between known branches costs nothing.
+**Git hook (on branch checkout).** The `post-checkout` hook that `tokensave install` sets up recognizes a *branch* checkout (as opposed to a file checkout) and runs `tokensave branch add` in the background. That command is a no-op when the branch is already tracked or is the default branch, so ordinary switching between known branches costs nothing. The initial checkout of a fresh `git clone` and of a new `git worktree add` is a branch checkout too, and it can land on a branch that is not the default one (`git clone -b feature`, `git worktree add -b feature`); there the hook runs `tokensave init` first and `tokensave branch add` after it, in that order. A hook written by an earlier version keeps the body it was installed with — the installer never rewrites an existing one — so on those installs a fresh worktree still needs `auto_track` below, or a manual `tokensave branch add`.
 
 **Open-time auto-track (opt-in).** When `TokenSave::open` runs — CLI command or MCP server start — and the active branch is untracked, tokensave can track it on the spot by copying the nearest tracked ancestor's DB and recording it in the branch metadata. This is gated by the `auto_track` config field (default `false`) or the `TOKENSAVE_AUTO_TRACK` environment variable, which overrides the config per-run (any value enables it except `0`, `false`, `no`, `off`, or empty). The copy is the same near-instant ancestor-DB copy a manual `branch add` performs; no sync runs at that moment — the `post-commit` hook keeps the new branch DB fresh as you commit, or run `tokensave sync` to refresh immediately. Auto-tracking is strictly best-effort: any failure is reported as a warning and `open()` proceeds with the usual ancestor fallback, so it can never break a tool call.
 
-In short: with the hook installed, checking out a new feature branch transparently gives it its own per-branch graph; with `auto_track` enabled, even a branch created outside a checkout (e.g. in a fresh worktree) is picked up the first time tokensave opens the project on it.
+In short: with the hook installed, checking out a new feature branch — including the branch a fresh clone or worktree starts on — transparently gives it its own per-branch graph; with `auto_track` enabled, even a branch created outside a checkout is picked up the first time tokensave opens the project on it.
 
 See [docs/BRANCHING-USER-GUIDE.md](docs/BRANCHING-USER-GUIDE.md) for the full guide.
 
@@ -440,6 +449,14 @@ Selected opens are read-only: they never initialize, sync, migrate, auto-track,
 or write graph/source data. They also do not contribute to savings accounting.
 Calls without selectors behave exactly as before.
 
+`graph_root` is only useful if you know the other project exists, so the server
+tells you: initialized projects sitting directly beside the served root are
+named in the MCP `instructions`, in `tokensave_status`, and in empty
+`tokensave_search` / `tokensave_context` results — the point at which a session
+would otherwise conclude a symbol does not exist rather than look next door
+(#375). Only immediate siblings are offered, at most five, and nothing is opened
+or indexed on their behalf; querying one still requires an explicit `graph_root`.
+
 Selectors are intentionally unavailable on tools that write, shell out, or
 depend on the current checkout: the edit primitives, VCS and branch tools,
 diagnostics and test execution, dependency and runtime introspection, workflow
@@ -454,13 +471,35 @@ ignoring it.
 | `tokensave_context` | Get relevant code context for a task -- entry points, related symbols, code snippets |
 | `tokensave_search` | Find symbols by name (functions, classes, types) |
 | `tokensave_node` | Get details + source code for a specific symbol |
-| `tokensave_files` | List indexed project files with filtering |
+| `tokensave_files` | List indexed project files (source and tracked artifacts) with filtering |
 | `tokensave_module_api` | Public API surface of a file or directory |
 | `tokensave_similar` | Find symbols with similar names |
 | `tokensave_annotations` | Attribute/annotation/decorator introspection -- histogram of all annotations or per-site listings with target filters |
 | `tokensave_doc` | Companion Markdown documentation for a source file -- doc content, the files it covers, and a staleness signal |
 | `tokensave_dependencies` | Package-manifest introspection across 17 ecosystems -- workspace summary, per-package lookup, license surface, version drift |
 | `tokensave_status` | Index status, statistics, tokens saved |
+
+#### Non-code artifacts
+
+`tokensave_files` covers more than source. Files whose extension is listed in
+`artifact_extensions` (`.feature`, `.json`, `.yaml`, `.yml`, `.sql`, `.toml`,
+`.proto`, `.graphql`, `.md` by default) are tracked by path so questions like
+"where are the `.feature` files for the login flow?" have a graph answer rather
+than a blocked `find` (#323). They are never parsed and contribute no symbols;
+`kind: "artifact"` and `kind: "code"` filter between the two, and analyses that
+mean "code" exclude them. An extension already handled by a language extractor
+is ignored in this list, so it cannot be used to stop a language being parsed.
+
+The list also decides what **literal search can look inside** (#442). A literal
+(`literal: true`) search over `tokensave_search` reads bytes rather than
+symbols, so it needs no parser -- but it iterates the indexed files, so it can
+only reach a file the index holds a row for. A tracked `.html` template or
+`.css` stylesheet has neither an extractor nor a default artifact entry, so its
+matches are missing; add the extension here and run `tokensave sync -f` and its
+lines are searched like any other, reported with `enclosing: null` since there
+is no symbol context. A literal response that could not reach every tracked
+file says so in an `unscanned` block naming the count and the extensions, so a
+partial answer is never presented as a complete one.
 
 ### Call Graph & Impact
 
@@ -478,11 +517,13 @@ ignoring it.
 | Tool | Purpose |
 |------|---------|
 | `tokensave_complexity` | Rank functions by cyclomatic & cognitive complexity, nesting depth, Halstead metrics, maintainability index, CRAP, and safety metrics |
-| `tokensave_dead_code` | Find unreachable symbols (no incoming edges) |
+| `tokensave_dead_code` | Find unreachable symbols (no incoming edges; symbols named as an ambiguity candidate are excluded) |
+| `tokensave_ambiguous_calls` | Call sites the resolver could not pin to one target, with every tied candidate |
 | `tokensave_god_class` | Find classes with too many members |
 | `tokensave_coupling` | Rank files by fan-in/fan-out |
 | `tokensave_inheritance_depth` | Find the deepest inheritance hierarchies |
 | `tokensave_circular` | Detect circular file dependencies |
+| `tokensave_imports` | Module-level import dependencies, cycles, and cut simulation |
 | `tokensave_recursion` | Detect recursive/mutually-recursive call cycles |
 | `tokensave_unused_imports` | Import statements never referenced |
 | `tokensave_doc_coverage` | Public symbols missing documentation |
@@ -570,6 +611,8 @@ Four resources are exposed via `resources/list` and `resources/read`:
 
 tokensave measures the tokens it saves on every MCP tool call. Each tool response includes a `tokensave_metrics: before=N after=M` line showing how many raw-file tokens were avoided by that specific call.
 
+**Turning the reporting off.** The metrics line, together with a sentence in the MCP `instructions`, asks the agent to report savings to you — which means the model spends *output* tokens narrating a saving tokensave made on *input* tokens. Output tokens are the more expensive kind, so if your agent mentions tokensave on nearly every turn, that narration can offset the win (#356). Set `report_savings` to `false` in `.tokensave/config.json`, or the `TOKENSAVE_REPORT_SAVINGS` environment variable to override it per-run (any value enables it except `0`, `false`, `no`, `off`, or empty). Both the metrics line and the instruction disappear; `tokensave install` likewise stops writing the reporting rule into agent prompt files. Measurement is untouched either way — every call still lands in the savings ledger, so `tokensave gain`, `tokensave list`, `status` and `monitor` keep reporting exactly as before. The default stays `true`.
+
 ### Cost observability
 
 ```bash
@@ -606,6 +649,10 @@ tokensave memory [--clean]
 ```
 
 A machine-wide memory report for every tokensave process (MCP servers, syncs, index runs), via a shared memory-mapped table at `~/.tokensave/memory.mmap`. Each instance self-samples its RSS best-effort at startup, per MCP tool call, and around the sync/resolution phases, so the report shows current and peak RSS **with the phase that produced the peak** — the data needed to attribute high memory use (see #253). Rows are flagged `alive`, `dead` (an OOM-killed process leaves its peak/phase behind as a forensic record), or `orphan` (still running but reparented to init). `--clean` purges dead slots.
+
+`PEAK PHASE` names the highest *sample*, so it is only as precise as the sampling. Incremental sync records, in order: `sync:extract`, `sync:resolve:load_nodes`, `sync:resolve:build_caches`, `sync:resolve:refs`, `sync:variants`, `sync:done`. A full index records `index:extract`, `index:resolve:build_caches`, `index:resolve:refs`, `index:resolve:done`, `index:insert`, `index:done`.
+
+**Each is recorded after the work it names.** They used to be recorded before it, so every sample reported the previous step's RSS under the next step's label — which attributed 73 MiB to the node load that in fact belonged to loading the unresolved references, a step with no sample at all, and pointed a memory investigation at the wrong subsystem for months (#409). If you add a phase, sample after the work, not before it, and add one for any step large enough to hold the peak.
 
 ### Session and lifetime counters
 
@@ -646,7 +693,7 @@ chmod +x .git/hooks/post-commit .git/hooks/post-checkout
 
 ### Upgrading from 5.x
 
-The standalone `tokensave daemon` command and its launchd/systemd/Windows Service autostart were removed in 6.0.0. The embedded OS-level file watcher that replaced the daemon was itself removed in 6.1.0 (it caused runaway CPU and memory on large monorepos with deep `node_modules` or `target` trees). The on-demand staleness model above is the current design.
+The standalone `tokensave daemon` command and its launchd/systemd/Windows Service autostart were removed in 6.0.0. The embedded OS-level file watcher that replaced the daemon was itself removed in 6.1.1 (it caused runaway CPU and memory on large monorepos with deep `node_modules` or `target` trees). The on-demand staleness model above is the current design.
 
 If you still have a daemon autostart from 5.x, remove it:
 
@@ -720,12 +767,14 @@ tokensave affected <files...> [--stdin] [--depth N]        # Find affected test 
 tokensave install [--agent NAME]   # Configure agent integration
 tokensave reinstall                # Refresh settings for all installed agents
 tokensave uninstall [--agent NAME] # Remove agent integration
-tokensave serve                    # Start MCP server
+tokensave serve [--idle-timeout-secs N]   # Start MCP server (N: exit after N idle seconds)
+tokensave servers [--json]         # List running servers and the index each one holds
 tokensave monitor                  # Live TUI showing MCP calls across all projects
 tokensave memory [--clean]         # Per-instance RSS report for all tokensave processes
 tokensave upgrade                  # Self-update to latest version
 tokensave channel [stable|beta]    # Show or switch update channel
 tokensave doctor [--agent NAME]    # Check installation health
+tokensave githooks [on|off] [--local]  # Manage git hooks (--local: this repo only, no core.hooksPath)
 tokensave branch add|list|remove|removeall|gc   # Multi-branch management
 tokensave current-counter          # Show per-project token counter
 tokensave reset-counter            # Reset per-project token counter
@@ -843,6 +892,7 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | Minecraft Function | `.mcfunction` | `lang-mcfunction` |
 | WGSL | `.wgsl` | `lang-wgsl` |
 | HLSL | `.hlsl`, `.fx` | `lang-hlsl` |
+| Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh` | `lang-systemverilog` |
 | Metal | `.metal` | `lang-metal` |
 | CUDA / HIP | `.cu`, `.cuh` | `lang-cuda` |
 | Markdown | `.md`, `.markdown` | `lang-markdown` |
@@ -880,7 +930,7 @@ tokensave is a ground-up Rust rewrite of [CodeGraph](https://www.npmjs.com/packa
 | **Install** | `brew install`, `cargo install`, `scoop install` | `npx @colbymchenry/codegraph` |
 | **Languages** | 50+ (3 tiers: lite/medium/full) | 19+ |
 | **MCP tools** | 80+ | 9 |
-| **Agent integrations** | 12+ (Claude, Codex, Gemini, Qwen, OpenCode, Cursor, Cline, Copilot, Roo Code, Zed, Antigravity, Kilo, Kiro, Kimi, Vibe, Grok, Pi, Plank, Factory Droid) | 1 (Claude Code) |
+| **Agent integrations** | 12+ (Claude, Codex, Gemini, Qwen, OpenCode, Cursor, Cline, Copilot, Roo Code, Zed, Antigravity, Kilo, Kiro, Kimi, Vibe, Grok, OMP, Pi, Plank, Factory Droid) | 1 (Claude Code) |
 | **Index freshness** | On-demand staleness check on every MCP call; catch-up sync on connect; multi-agent work expected to use git worktrees | Native OS-level file watcher (FSEvents/inotify/ReadDirectoryChangesW, 2 s debounce); catch-up sync on connect |
 | **Multi-branch indexing** | Yes, opt-in (per-branch DBs, cross-branch diff/search) | No |
 | **Complexity metrics** | AST-extracted (branches, loops, nesting depth, cyclomatic & cognitive complexity, Halstead, maintainability index, CRAP) | No |

@@ -5,6 +5,7 @@ use libsql::params;
 
 use super::connection::{CachedTraitDispatchCaller, Database};
 use crate::errors::{Result, TokenSaveError};
+use crate::resolution::{AmbiguityRefKey, TouchedNode};
 use crate::types::*;
 
 mod clear;
@@ -13,6 +14,7 @@ mod files;
 mod fingerprints;
 mod metadata;
 mod nodes;
+pub use nodes::NodeFilter;
 mod search;
 pub(crate) use search::to_fts_match_query;
 mod stats;
@@ -169,6 +171,7 @@ pub(crate) fn row_to_file(row: &libsql::Row) -> std::result::Result<FileRecord, 
         modified_at: row.get::<i64>(3)?,
         indexed_at: row.get::<i64>(4)?,
         node_count: row.get::<u32>(5)?,
+        kind: crate::types::FileKind::from_str_or_code(&row.get::<String>(6)?),
     })
 }
 
@@ -283,7 +286,7 @@ pub(crate) fn display_language_for_path(path: &str) -> &'static str {
         "swift" => "Swift",
         "as" => "ActionScript",
         "c" | "h" => "C",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "C++",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "inl" | "ipp" | "tcc" => "C++",
         "cs" => "C#",
         "fs" | "fsi" | "fsx" => "F#",
         "fst" | "fsti" => "F*",

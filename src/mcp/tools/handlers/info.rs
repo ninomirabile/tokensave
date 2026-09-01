@@ -8,10 +8,13 @@ use serde_json::{json, Value};
 
 use crate::errors::{Result, TokenSaveError};
 use crate::tokensave::TokenSave;
-use crate::types::{NodeKind, Visibility};
+use crate::types::{FileKind, NodeKind, Visibility};
 
 use super::super::ToolResult;
-use super::{effective_path, require_node_id, truncate_response, unique_file_paths};
+use super::{
+    effective_path, require_node_id, sibling_projects, truncate_response, unique_file_paths,
+    SIBLING_HINT,
+};
 
 /// Handles `tokensave_status` tool calls.
 pub(super) async fn handle_status(
@@ -21,6 +24,7 @@ pub(super) async fn handle_status(
 ) -> Result<ToolResult> {
     let stats = cg.get_stats().await?;
     let mut output: Value = serde_json::to_value(&stats).unwrap_or(json!({}));
+    output["project_root"] = json!(cg.project_root().to_string_lossy());
     output["version"] = json!(env!("CARGO_PKG_VERSION"));
     if let Some(ss) = server_stats {
         output["server"] = ss;
@@ -91,6 +95,16 @@ pub(super) async fn handle_status(
         output["scope_prefix"] = json!(prefix);
     }
 
+    // Sibling repos are reachable through `graph_root` but invisible otherwise,
+    // so a session working across two checkouts concludes the symbol does not
+    // exist rather than querying the other graph (#375). Surfaced here as well
+    // as at initialize, because a sibling may have been indexed mid-session.
+    let siblings = sibling_projects(cg.project_root()).await;
+    if !siblings.is_empty() {
+        output["sibling_projects"] = json!(siblings);
+        output["sibling_projects_hint"] = json!(SIBLING_HINT);
+    }
+
     let formatted = serde_json::to_string_pretty(&output).unwrap_or_default();
     Ok(ToolResult {
         value: json!({
@@ -98,6 +112,18 @@ pub(super) async fn handle_status(
         }),
         touched_files: vec![],
     })
+}
+
+/// Describes what a listed file holds, for the `tokensave_files` rendering.
+///
+/// An artifact is labelled rather than reported as "0 symbols", which would be
+/// indistinguishable from a source file the extractor found nothing in — and
+/// would read as a parse failure rather than a file that was never parsed.
+fn describe_contents(file: &crate::types::FileRecord) -> String {
+    match file.kind {
+        FileKind::Artifact => "artifact".to_string(),
+        FileKind::Code => format!("{} symbols", file.node_count),
+    }
 }
 
 /// Handles `tokensave_files` tool calls.
@@ -127,6 +153,15 @@ pub(super) async fn handle_files(
         }
     }
 
+    // Artifacts are tracked by path and carry no symbols (#323), so a caller
+    // after source files needs a way to say so without pattern-matching
+    // extensions by hand.
+    match args.get("kind").and_then(|v| v.as_str()) {
+        Some("code") => files.retain(|f| f.kind == FileKind::Code),
+        Some("artifact") => files.retain(|f| f.kind == FileKind::Artifact),
+        _ => {}
+    }
+
     // Listing files is metadata-only — no source code is served, so no tokens saved.
     let touched_files = vec![];
 
@@ -138,7 +173,7 @@ pub(super) async fn handle_files(
     let output = if format == "flat" {
         files
             .iter()
-            .map(|f| format!("{} ({} symbols, {} bytes)", f.path, f.node_count, f.size))
+            .map(|f| format!("{} ({}, {} bytes)", f.path, describe_contents(f), f.size))
             .collect::<Vec<_>>()
             .join("\n")
     } else {
@@ -156,7 +191,7 @@ pub(super) async fn handle_files(
             groups
                 .entry(dir)
                 .or_default()
-                .push(format!("{} ({} symbols)", name, f.node_count));
+                .push(format!("{} ({})", name, describe_contents(f)));
         }
         let mut lines = Vec::new();
         lines.push(format!("{} indexed files", files.len()));

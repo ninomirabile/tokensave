@@ -1,6 +1,6 @@
 [package]
 name = "tokensave"
-version = "7.8.1"
+version = "7.11.0"
 edition = "2021"
 description = "Code intelligence tool that builds a semantic knowledge graph from Rust, Go, Java, Scala, TypeScript, Python, C, C++, Kotlin, C#, Swift, and many more codebases"
 license = "MIT"
@@ -31,7 +31,7 @@ default = ["full"]
 lite = []
 
 medium = ["lang-dart", "lang-pascal", "lang-php", "lang-ruby", "lang-bash", "lang-protobuf", "lang-powershell", "lang-nix", "lang-vbnet"]
-full = ["medium", "lang-actionscript", "lang-lua", "lang-zig", "lang-objc", "lang-perl", "lang-batch", "lang-fortran", "lang-cobol", "lang-msbasic2", "lang-gwbasic", "lang-qbasic", "lang-dockerfile", "lang-glsl", "lang-wgsl", "lang-hlsl", "lang-metal", "lang-cuda", "lang-markdown", "lang-r", "lang-sql", "lang-julia", "lang-haskell", "lang-ocaml", "lang-clojure", "lang-erlang", "lang-elixir", "lang-fsharp", "lang-fstar", "lang-quint", "lang-toml", "lang-lean", "lang-gdscript", "lang-xaml", "lang-mcfunction"]
+full = ["medium", "lang-actionscript", "lang-lua", "lang-zig", "lang-objc", "lang-perl", "lang-batch", "lang-fortran", "lang-cobol", "lang-msbasic2", "lang-gwbasic", "lang-qbasic", "lang-dockerfile", "lang-glsl", "lang-wgsl", "lang-hlsl", "lang-metal", "lang-cuda", "lang-markdown", "lang-r", "lang-sql", "lang-julia", "lang-haskell", "lang-ocaml", "lang-clojure", "lang-erlang", "lang-elixir", "lang-fsharp", "lang-fstar", "lang-quint", "lang-toml", "lang-lean", "lang-gdscript", "lang-xaml", "lang-mcfunction", "lang-systemverilog", "lang-canvas"]
 
 # Language features (all grammars provided by tokensave-large-treesitters)
 # ActionScript uses a vendored grammar compiled by build.rs (not the bundle).
@@ -59,9 +59,12 @@ lang-dockerfile = []
 lang-glsl = []
 lang-wgsl = []
 lang-hlsl = ["dep:tree-sitter-hlsl"]
+lang-systemverilog = ["dep:tree-sitter-systemverilog"]
 lang-metal = []
 lang-cuda = []
 lang-markdown = []
+# Obsidian Canvas: plain JSON, no tree-sitter grammar (#459).
+lang-canvas = []
 lang-r = []
 lang-sql = []
 lang-julia = []
@@ -129,6 +132,7 @@ crossterm = "0.28"
 fs2 = "0.4"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tree-sitter-hlsl = { version = "0.2.0", optional = true }
+tree-sitter-systemverilog = { version = "0.4", optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 flate2 = "1"
@@ -150,3 +154,16 @@ criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 name = "large_repos"
 harness = false
 
+# libsql 0.9.30 closes every local connection twice (`sqlite3_close_v2` on an
+# already-freed `sqlite3` handle), which is a use-after-free on every platform
+# and an intermittent STATUS_ACCESS_VIOLATION on Windows (#367, #308). See
+# `vendor/libsql/src/local/connection.rs` for the one-line fix and the upstream
+# references. `vendor/libsql` is a copy of the published 0.9.30 crate: its
+# sources are unchanged apart from that one function, and its examples, tests,
+# benches, test assets, lockfile and contributor notes are dropped, with
+# `[lints]` and `[workspace]` tables added to its manifest and upstream's MIT
+# licence kept alongside it. Drop this
+# patch — and the vendored copy — as soon as a libsql release carries the fix;
+# `tests/vendored_libsql_test.rs` fails if the two drift apart.
+[patch.crates-io]
+libsql = { path = "vendor/libsql" }

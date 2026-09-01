@@ -34,14 +34,17 @@ fn run(dir: &std::path::Path, args: &[&str]) -> String {
     )
 }
 
-/// A project whose only indexable file is documentation: the Verilog source
-/// from the issue has no registered extractor.
+/// A project whose only indexable file is documentation.
+///
+/// #345 used the Verilog source from its own report here; #344 has since added
+/// a Verilog extractor, so this now uses VHDL — still a real hardware language,
+/// still with no registered extractor.
 fn project_with_unsupported_source() -> TempDir {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("README.md"), "# readme\n").unwrap();
     std::fs::write(
-        dir.path().join("example.v"),
-        "module example (\n    input wire clk\n);\nendmodule\n",
+        dir.path().join("example.vhd"),
+        "entity example is\nend example;\n",
     )
     .unwrap();
     dir
@@ -52,7 +55,7 @@ fn project_with_unsupported_source() -> TempDir {
 fn headline_count(output: &str) -> usize {
     output
         .lines()
-        .filter(|l| l.contains("Skipped 1 tracked file (unsupported extension): .v (1)"))
+        .filter(|l| l.contains("Skipped 1 tracked file (unsupported extension): .vhd (1)"))
         .count()
 }
 
@@ -73,7 +76,7 @@ fn sync_reports_the_unsupported_source_file() {
     let dir = project_with_unsupported_source();
     run(dir.path(), &["init"]);
     // A no-op sync is the confusing case from the issue: "0 added, 0 modified,
-    // 0 removed" with no hint that example.v was never indexed.
+    // 0 removed" with no hint that example.vhd was never indexed.
     let output = run(dir.path(), &["sync"]);
 
     assert!(
@@ -104,7 +107,7 @@ fn detailed_modes_do_not_duplicate_the_compact_summary() {
     let verbose = run(dir.path(), &["sync", "--verbose"]);
     assert_eq!(headline_count(&verbose), 0, "verbose output: {verbose}");
     assert!(
-        verbose.contains(".v: 1 file(s) skipped (no registered extractor)"),
+        verbose.contains(".vhd: 1 file(s) skipped (no registered extractor)"),
         "verbose must still list the skipped extension: {verbose}"
     );
 }
@@ -124,5 +127,40 @@ fn nothing_is_reported_when_every_file_is_supported() {
     assert!(
         !output.contains("unsupported extension"),
         "a fully supported project must stay quiet: {output}"
+    );
+}
+
+/// Regression for #373: a non-interactive `init` (stdin closed, never a TTY)
+/// must still write the default local git exclusion, instead of silently
+/// dropping it and leaving `.tokensave/` untracked.
+#[test]
+fn init_without_tty_still_excludes_tokensave_from_git() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .arg("init")
+        .arg("-q")
+        .status()
+        .expect("failed to git init");
+    assert!(init.success(), "git init must succeed");
+
+    // `run` drives the real binary with stdin closed, so this is the
+    // non-interactive path from #373.
+    let output = run(&repo, &["init"]);
+    assert!(
+        output.contains("Added .tokensave/ to .git/info/exclude (local, untracked)"),
+        "non-interactive init must report the local exclusion: {output}"
+    );
+
+    let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+    assert!(
+        exclude.lines().any(|l| l.trim() == ".tokensave/"),
+        "non-interactive init must write .tokensave/ to .git/info/exclude, got: {exclude}"
     );
 }

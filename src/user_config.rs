@@ -69,7 +69,12 @@ pub struct UserConfig {
     #[serde(default)]
     pub installed_agents: Vec<String>,
 
-    /// Debounce duration for the embedded MCP file watcher (e.g. "2s", "15s", "1m").
+    /// Debounce interval for the embedded MCP file watcher, which was
+    /// removed in 6.1.1 (#80). Nothing reads this field: index freshness
+    /// now comes from the on-demand staleness check run at the top of
+    /// every MCP `tools/call`, and its 30 s cooldown is not configurable.
+    /// Kept for now because dropping it would silently strip the key from
+    /// existing `config.toml` files on their next save (#390).
     #[serde(default = "default_watcher_debounce", alias = "daemon_debounce")]
     pub watcher_debounce: String,
 
@@ -296,8 +301,7 @@ const LEGACY_STATE_KEYS: &[&str] = &[
 
 fn contains_legacy_state(contents: &str) -> bool {
     toml::from_str::<toml::Table>(contents)
-        .ok()
-        .is_some_and(|table| LEGACY_STATE_KEYS.iter().any(|key| table.contains_key(*key)))
+        .is_ok_and(|table| LEGACY_STATE_KEYS.iter().any(|key| table.contains_key(*key)))
 }
 
 /// Overlays the state fields of `StateFile` onto an in-memory `UserConfig`.

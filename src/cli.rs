@@ -5,10 +5,10 @@ fn agent_value_parser() -> PossibleValuesParser {
 }
 
 /// Whether `tokensave install` should offer to install the global git
-/// `post-commit` hook, and if so, whether to ask interactively or act
-/// non-interactively. Re-exported from `tokensave::agents::GitHookMode`
-/// so the enum lives in one place and both the CLI parser and the
-/// install dispatch see the same definition.
+/// `post-commit`/`post-checkout`/`post-merge` hooks, and if so, whether to
+/// ask interactively or act non-interactively. Re-exported from
+/// `tokensave::agents::GitHookMode` so the enum lives in one place and both
+/// the CLI parser and the install dispatch see the same definition.
 pub use tokensave::agents::GitHookMode;
 
 /// Code intelligence for Rust codebases.
@@ -32,6 +32,12 @@ pub enum Commands {
         /// Folders to skip during indexing (can be repeated)
         #[arg(long = "skip-folder", num_args = 1..)]
         skip_folders: Vec<String>,
+        /// Install this repository's own git hooks without asking (#455)
+        #[arg(long, conflicts_with = "no_git_hook")]
+        git_hook: bool,
+        /// Do not offer this repository's own git hooks
+        #[arg(long = "no-git-hook")]
+        no_git_hook: bool,
     },
     /// Incremental sync (project must already be initialized with `tokensave init`)
     Sync {
@@ -92,10 +98,12 @@ pub enum Commands {
         /// Agent to configure (auto-detects if omitted)
         #[arg(long, value_parser = agent_value_parser())]
         agent: Option<String>,
-        /// Whether to install a global git `post-commit` hook that runs
-        /// `tokensave sync` after each commit. `default` preserves the
-        /// interactive prompt (or silent skip on non-TTY). `yes` installs
-        /// the hook without asking; `no` skips it without asking.
+        /// Whether to install global git `post-commit` + `post-merge` hooks
+        /// that run `tokensave sync` after each commit and after `git pull`
+        /// (plus a `post-checkout` hook for fresh clones/branch tracking).
+        /// `default` preserves the interactive prompt (or silent skip on
+        /// non-TTY). `yes` installs the hooks without asking; `no` skips
+        /// them without asking.
         #[arg(long, value_enum, default_value_t = GitHookMode::Default)]
         git_hook: GitHookMode,
         /// Install into the current project's config instead of the user's
@@ -139,6 +147,11 @@ pub enum Commands {
         /// instead of the global config.
         #[arg(long)]
         local: bool,
+        /// Leave tokensave's global git hooks in place. Without this, a global
+        /// uninstall removes them, so a later commit cannot recreate an index
+        /// (#420).
+        #[arg(long)]
+        keep_git_hooks: bool,
     },
     /// Extraction worker (spawned by tokensave itself; not for direct use).
     #[command(name = "extract-worker", hide = true)]
@@ -174,6 +187,30 @@ pub enum Commands {
         /// Useful for profiling index work vs. JSON-RPC / stdio overhead.
         #[arg(long)]
         timings: bool,
+        /// Exit after this many seconds with no request (#436)
+        ///
+        /// Off by default, which keeps today's indefinite lifetime. Turn it on
+        /// when a host leaks servers — one per subagent, none of them exiting,
+        /// because the host never closes their stdin so the EOF that would
+        /// stop them never arrives. Only safe if your host starts a fresh
+        /// server when a tool is called after an idle exit; probe that before
+        /// relying on it. The deadline is only ever checked while the server
+        /// is waiting for a request, so it cannot interrupt one.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        idle_timeout_secs: Option<u64>,
+    },
+    /// List running `tokensave serve` processes and the index each one holds
+    ///
+    /// `serve` keeps an exclusive handle on its database for the life of the
+    /// process, so an indexed directory cannot be deleted while a client has a
+    /// server up — on Windows that is a hard block. This answers which process
+    /// holds which index. It deliberately does not stop anything: MCP clients
+    /// restart their servers, so a stop the host undoes is a trap that looks
+    /// like a fix (#421).
+    Servers {
+        /// Emit JSON, matching the `~/.tokensave/servers/<pid>.json` entries
+        #[arg(long)]
+        json: bool,
     },
     /// Download and install the latest version from GitHub
     Upgrade {
@@ -214,6 +251,25 @@ pub enum Commands {
         path: Option<String>,
         /// "on" to enable, "off" to disable, omit to show current setting
         action: Option<String>,
+    },
+    /// Show or remove the global git hooks tokensave installs
+    #[command(name = "githooks")]
+    Githooks {
+        /// "off" to remove tokensave's git hooks, "on" to install them,
+        /// omit to show what is currently installed
+        action: Option<String>,
+        /// Act on this repository's own hooks instead of the global ones (#455)
+        ///
+        /// Global hooks work by claiming `core.hooksPath`, which is a single
+        /// machine-wide setting: it forces one hook directory on every
+        /// repository and makes git ignore each one's `.git/hooks`. Use
+        /// `--local` when your projects need different tooling. No git config
+        /// is touched, so other repositories are unaffected.
+        #[arg(long)]
+        local: bool,
+        /// Repository to act on with `--local` (default: current directory)
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
     },
     /// Check tokensave installation, configuration, and agent integration
     Doctor {
@@ -341,6 +397,16 @@ pub enum BranchAction {
         /// Project path (default: current directory)
         #[arg(short, long)]
         path: Option<String>,
+        /// Only track when auto-tracking is enabled, otherwise exit
+        /// successfully without doing anything (#397).
+        ///
+        /// For automated callers — the `post-checkout` hook passes this — so
+        /// the `auto_track` config field (or `TOKENSAVE_AUTO_TRACK`) governs
+        /// auto-tracking on every entry point rather than only inside
+        /// `TokenSave::open`. A human typing `branch add` has asked for it, so
+        /// the flag is opt-in rather than the default.
+        #[arg(long)]
+        if_enabled: bool,
     },
     /// Remove a tracked branch and delete its DB
     Remove {
