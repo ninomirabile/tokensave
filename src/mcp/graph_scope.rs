@@ -266,7 +266,12 @@ pub(crate) fn merge_federated_results(
         roots.join(", ")
     );
     if !collapsed.is_empty() {
-        let names: Vec<String> = collapsed.iter().map(|p| p.display().to_string()).collect();
+        // Spelled like the kept roots: a caller that passed a canonicalized
+        // Windows path must not see its `\\?\` verbatim prefix echoed back.
+        let names: Vec<String> = collapsed
+            .iter()
+            .map(|p| normalize_provenance_path(&p.to_string_lossy()))
+            .collect();
         // Reported rather than dropped silently: a caller who named a root and
         // never sees it again is owed the reason.
         let _ = write!(
@@ -295,7 +300,7 @@ pub(crate) fn merge_federated_results(
 
 pub(crate) async fn select_graph(
     selector: GraphSelector,
-    served_root: &Path,
+    served_root: Option<&Path>,
 ) -> Result<SelectedGraph> {
     if !selector.root.is_absolute() {
         return Err(config_error("graph_root must be an absolute path"));
@@ -314,13 +319,19 @@ pub(crate) async fn select_graph(
         )));
     }
 
-    let canonical_served_root = served_root.canonicalize().map_err(|error| {
-        config_error(format!(
-            "served graph root '{}' could not be canonicalized: {error}",
-            served_root.display()
-        ))
-    })?;
-    if canonical_root == canonical_served_root {
+    // A server with no default project (#606) serves nothing graph_root
+    // could collide with.
+    let canonical_served_root = served_root
+        .map(|served_root| {
+            served_root.canonicalize().map_err(|error| {
+                config_error(format!(
+                    "served graph root '{}' could not be canonicalized: {error}",
+                    served_root.display()
+                ))
+            })
+        })
+        .transpose()?;
+    if canonical_served_root.as_ref() == Some(&canonical_root) {
         let remedy = if selector.branch.is_some() {
             "; omit graph_root and graph_branch to query the currently served graph \
              (selecting a different branch of the served project is not supported)"
@@ -900,7 +911,7 @@ mod tests {
             root: graph.path().to_path_buf(),
             branch: None,
         };
-        let selected = select_graph(selector, served.path()).await.unwrap();
+        let selected = select_graph(selector, Some(served.path())).await.unwrap();
         (served, graph, selected)
     }
 
@@ -961,7 +972,7 @@ mod tests {
             (served.path().to_path_buf(), "same"),
         ] {
             let selector = GraphSelector { root, branch: None };
-            let message = error_text(select_graph(selector, served.path()).await);
+            let message = error_text(select_graph(selector, Some(served.path())).await);
             assert!(message.contains(needle), "{message}");
         }
     }
@@ -976,7 +987,7 @@ mod tests {
                     root: served.path().to_path_buf(),
                     branch: None,
                 },
-                served.path(),
+                Some(served.path()),
             )
             .await,
         );
@@ -989,7 +1000,7 @@ mod tests {
                     root: served.path().to_path_buf(),
                     branch: Some("feature".to_string()),
                 },
-                served.path(),
+                Some(served.path()),
             )
             .await,
         );
@@ -1027,7 +1038,7 @@ mod tests {
                     root: child,
                     branch: None,
                 },
-                served.path(),
+                Some(served.path()),
             )
             .await,
         );
@@ -1045,7 +1056,7 @@ mod tests {
                     root: uninitialized.path().to_path_buf(),
                     branch: None,
                 },
-                served.path(),
+                Some(served.path()),
             )
             .await,
         );
@@ -1058,7 +1069,7 @@ mod tests {
                     root: graph.path().to_path_buf(),
                     branch: Some("feature".to_string()),
                 },
-                served.path(),
+                Some(served.path()),
             )
             .await,
         );

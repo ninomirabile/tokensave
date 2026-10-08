@@ -159,11 +159,19 @@ Expected: Returns symbols like `extract_python`, `extract_ruby`, `RustExtractor`
 
 ---
 
-## tokensave_rename_preview
+## tokensave_rename
 
-> If I rename the `search` method, what would be affected? Search for it first, then preview the rename.
+> I want to rename the `search` method to `find_symbols`. Search for it first, then show me the rename plan without editing anything.
 
-Expected: Returns all edges (callers, containers, etc.) referencing that symbol.
+Expected: A dry run (`dry_run` defaults to true). Returns the definition and every incoming reference grouped by file, each with a 1-based line and column and a confidence class (`exact`, `heuristic`, `ambiguous`, `text_only`), counts per class, and a unified diff of the edits it would apply. Comments, strings and docs that mention the name are listed under `text_only` and are not in the diff.
+
+> Now apply it.
+
+Expected: With `dry_run: false`, the rename is refused if any site is `heuristic` or `ambiguous` (or an unlinked identifier mentions the name), listing those sites. With `allow_heuristic: true` the heuristic sites are edited too; ambiguous and text-only sites never are. Refuses a keyword, a non-identifier, or a name already used in the same scope. On success, reports the files changed.
+
+> Preview the rename with the old tool name, `tokensave_rename_preview`.
+
+Expected: Same plan as a dry run of `tokensave_rename`; the alias never edits, even with `dry_run: false`. It does not appear in `tools/list`.
 
 ---
 
@@ -848,19 +856,19 @@ Expected: Returns `{status: "no_baseline", message: "No session baseline found. 
 
 ## tokensave_read
 
-> Read a file with mode-aware compression. Modes: `full`, `lines`, `map`, `signatures`. Cross-session cached.
+> Read a file with mode-aware compression. Modes: `full`, `lines`, `map`, `signatures`. `full` and `lines` are line-numbered. Pass a held `digest` back as `if_digest` to get an `unchanged` stub.
 
 Test full content:
 ```
 tokensave_read(file="src/sync.rs", mode="full")
 ```
-Expected: Returns the entire file body, plus `mtime_ns`, `digest`, and `token_count`.
+Expected: Returns the entire file body, each line prefixed with its right-aligned line number and a tab, plus `mtime_ns`, `digest`, and `token_count`.
 
 Test line slice:
 ```
 tokensave_read(file="src/sync.rs", mode="lines", lines="120-180")
 ```
-Expected: Returns only the requested 1-based inclusive range.
+Expected: Returns only the requested 1-based inclusive range, numbered from 120.
 
 Test map (graph-only, no source bytes touched):
 ```
@@ -874,12 +882,13 @@ tokensave_read(file="src/sync.rs", mode="signatures")
 ```
 Expected: Functions and types with their cached signature strings.
 
-Test cache hit (call the same query twice):
+Test digest revalidation:
 ```
-tokensave_read(file="src/sync.rs", mode="full")  # populates cache
-tokensave_read(file="src/sync.rs", mode="full")  # second call
+tokensave_read(file="src/sync.rs", mode="full")                        # note the digest
+tokensave_read(file="src/sync.rs", mode="full")                        # body again
+tokensave_read(file="src/sync.rs", mode="full", if_digest="<digest>")  # stub
 ```
-Expected: The second call returns `{"unchanged": true, "digest": ..., "mtime_ns": ..., "token_count": ...}` — a small stub instead of the full body.
+Expected: The second call returns the full body again. The third returns `unchanged: true` with the same `digest` and `token_count` — a small stub instead of the full body. After the file is edited, the same `if_digest` returns the new body.
 
 ---
 

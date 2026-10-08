@@ -6,6 +6,40 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 impl Database {
+    /// The typed-receiver call refs (`Bus::again()::subscribe`, #597;
+    /// `Factory::Create()::Write`, #642): `calls` refs from `.gd` and `.cs`
+    /// files whose name holds a `::` type expression. A small slice of the table, read before an incremental
+    /// resolution to find the call sites whose existing edges may be stale.
+    pub async fn get_gdscript_typed_refs(&self) -> Result<Vec<UnresolvedRef>> {
+        let mut rows = self
+            .conn()
+            .query(
+                "SELECT from_node_id, reference_name, line, col, file_path
+                 FROM unresolved_refs
+                 WHERE reference_kind = 'calls'
+                   AND (file_path LIKE '%.gd' OR file_path LIKE '%.cs')
+                   AND instr(reference_name, '::') > 0",
+                (),
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query typed-receiver refs: {e}"),
+                operation: "get_gdscript_typed_refs".to_string(),
+            })?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(UnresolvedRef {
+                from_node_id: row.get::<String>(0).unwrap_or_default(),
+                reference_name: row.get::<String>(1).unwrap_or_default(),
+                reference_kind: EdgeKind::Calls,
+                line: row.get::<u32>(2).unwrap_or(0),
+                column: row.get::<u32>(3).unwrap_or(0),
+                file_path: row.get::<String>(4).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Inserts a single unresolved reference.
     pub async fn insert_unresolved_ref(&self, uref: &UnresolvedRef) -> Result<()> {
         self.conn()
@@ -172,6 +206,49 @@ impl Database {
                     file_path: row.get::<String>(6).unwrap_or_default(),
                 },
             ));
+        }
+        Ok(out)
+    }
+
+    /// The raw references recorded from any of `source_ids`, with their
+    /// columns.
+    ///
+    /// The edge a reference resolved to keeps only its line; the column lives
+    /// here. `tokensave_rename` reads it back to find which identifier on the
+    /// line an edge came from. Batched to stay under `SQLite`'s bound
+    /// parameter limit.
+    pub async fn get_unresolved_refs_for_sources(
+        &self,
+        source_ids: &[String],
+    ) -> Result<Vec<UnresolvedRef>> {
+        let mut out = Vec::new();
+        for chunk in source_ids.chunks(500) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT from_node_id, reference_name, reference_kind, line, col, file_path
+                 FROM unresolved_refs WHERE from_node_id IN ({})",
+                placeholders.join(", ")
+            );
+            let values: Vec<libsql::Value> = chunk
+                .iter()
+                .map(|id| libsql::Value::Text(id.clone()))
+                .collect();
+            let mut rows = self
+                .conn()
+                .query(&sql, libsql::params_from_iter(values))
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to query unresolved refs by source: {e}"),
+                    operation: "get_unresolved_refs_for_sources".to_string(),
+                })?;
+            out.extend(
+                collect_rows(
+                    &mut rows,
+                    row_to_unresolved_ref,
+                    "get_unresolved_refs_for_sources",
+                )
+                .await?,
+            );
         }
         Ok(out)
     }

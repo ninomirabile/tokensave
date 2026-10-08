@@ -137,10 +137,28 @@ impl TouchedSet {
     /// The name test mirrors the resolver's own pre-filter — literal name, then
     /// trailing simple name — because a qualified ref such as `Self::method`
     /// reaches its candidates through the simple name, not verbatim (#141).
+    ///
+    /// A typed-receiver ref (`GDScript` `Bus::again()::subscribe`, #597; C#
+    /// `Factory::await Create()::Write`, #642) also depends on every class and
+    /// member it steps through, so any of its segments being touched
+    /// re-attempts it.
+    ///
+    /// A relative JS/TS import (`./hash.js`) resolves to a `File` node, whose
+    /// name is its path, so it is re-attempted when any file it may name was
+    /// added or removed (#647).
     pub fn needs_resolve(&self, file_path: &str, reference_name: &str) -> bool {
         self.files.contains(file_path)
             || self.names.contains(reference_name)
             || self.names.contains(super::simple_ref_name(reference_name))
+            || (super::has_typed_receiver_refs(file_path)
+                && reference_name.contains("::")
+                && reference_name.split("::").any(|seg| {
+                    let seg = seg.strip_prefix("await ").unwrap_or(seg);
+                    self.names.contains(seg.trim_end_matches("()"))
+                }))
+            || super::relative_module_candidates(file_path, reference_name)
+                .iter()
+                .any(|candidate| self.names.contains(candidate))
     }
 
     /// The files whose references were re-extracted this sync.

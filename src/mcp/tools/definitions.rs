@@ -63,6 +63,52 @@ fn def_always_load(
     }
 }
 
+/// `graph_root` description for a tool that answers about one graph.
+///
+/// It used to be one 457-byte paragraph repeated verbatim on every one of the
+/// 53 graph-scoped tools, re-sent every turn before any tool is called
+/// (#576). Each description is now one sentence; the full cross-project rules
+/// go once per session in [`GRAPH_SELECTOR_INSTRUCTIONS`]. Only the tools in
+/// [`FEDERATABLE_TOOLS`](crate::mcp::graph_scope::FEDERATABLE_TOOLS) mention
+/// the array form, because only they accept it.
+///
+/// The schema keeps `anyOf` everywhere: an array reaching a single-graph tool
+/// is rejected at the call with a message that names the tools that accept
+/// one, and narrowing the schema instead would turn that into an opaque
+/// validation error.
+///
+/// Like [`CONTEXT_DESCRIPTION`], these must stay constant: a changed byte
+/// invalidates the client's cached prompt prefix.
+const GRAPH_ROOT_DESCRIPTION: &str =
+    "Absolute root of another initialized project to query. Omit for the served project.";
+
+/// `graph_root` description for the tools that accept an array of roots.
+const GRAPH_ROOT_FEDERATED_DESCRIPTION: &str =
+    "Absolute root of another initialized project to query, or an array of roots to query \
+     together. Omit for the served project.";
+
+/// `graph_branch` description.
+const GRAPH_BRANCH_DESCRIPTION: &str =
+    "Tracked branch to query within graph_root. Requires graph_root.";
+
+/// The cross-project rules that the `graph_root` descriptions no longer carry
+/// (#576). The server sends this once per session in its instructions.
+pub const GRAPH_SELECTOR_INSTRUCTIONS: &str =
+    " A tool with a graph_root parameter can query another initialized project: pass that \
+     project's absolute root, and graph_branch to select one of its tracked branches. \
+     tokensave_search and tokensave_files also accept an array of roots and answer across all \
+     of them at once, interleaving results by rank; roots that are worktrees of a repository \
+     already named are collapsed, and the response says which. Every other tool answers about \
+     a single graph and rejects an array.";
+
+fn graph_root_description(tool: &str) -> &'static str {
+    if crate::mcp::graph_scope::FEDERATABLE_TOOLS.contains(&tool) {
+        GRAPH_ROOT_FEDERATED_DESCRIPTION
+    } else {
+        GRAPH_ROOT_DESCRIPTION
+    }
+}
+
 /// Add the explicit selectors and metadata used by tools that can query any
 /// initialized graph.
 fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
@@ -85,20 +131,14 @@ fn graph_scoped(mut definition: ToolDefinition) -> ToolDefinition {
                 { "type": "string" },
                 { "type": "array", "items": { "type": "string" } }
             ],
-            "description": "Exact absolute initialized project root to query. Omit to query \
-             the project this server already serves; when present it must name a different \
-             project. `tokensave_search` and `tokensave_files` also accept an array of roots \
-             and answer across all of them at once, interleaving results by rank; roots that \
-             are worktrees of a repository already named are collapsed, and the response says \
-             which. Every other tool answers about a single graph and rejects an array."
+            "description": graph_root_description(&definition.name)
         }),
     );
     properties.insert(
         "graph_branch".to_string(),
         json!({
             "type": "string",
-            "description": "Exact tracked branch to query within graph_root. Requires \
-             graph_root."
+            "description": GRAPH_BRANCH_DESCRIPTION
         }),
     );
 
@@ -119,6 +159,58 @@ pub fn is_graph_scoped_tool(definition: &ToolDefinition) -> bool {
         .meta
         .as_ref()
         .and_then(|meta| meta.get("tokensave/graphScoped"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Mark a tool that stays callable but is never sent in `tools/list`: an
+/// alias kept so existing callers and permission lists keep working while
+/// new callers see only its replacement.
+fn hidden(mut definition: ToolDefinition) -> ToolDefinition {
+    let Some(meta) = definition
+        .meta
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        panic!("tool metadata must be an object");
+    };
+    meta.insert("tokensave/hidden".to_string(), json!(true));
+    definition
+}
+
+/// Whether a tool is a hidden alias (see [`hidden`]).
+pub fn is_hidden_tool(definition: &ToolDefinition) -> bool {
+    definition
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("tokensave/hidden"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Mark a read-only local-graph tool that has no `graph_root`/`graph_branch`
+/// selectors, so the branch-drift gate refuses it once the served branch has
+/// drifted. Deriving the refused set from this marker (instead of a
+/// hard-coded name list) keeps the gate covering any future selector-less
+/// local graph tool automatically.
+fn local_graph_no_selectors(mut definition: ToolDefinition) -> ToolDefinition {
+    let Some(meta) = definition
+        .meta
+        .get_or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        panic!("tool metadata must be an object");
+    };
+    meta.insert("tokensave/localGraphNoSelectors".to_string(), json!(true));
+    definition
+}
+
+/// Whether a tool reads the served local graph but cannot select another one.
+pub fn is_selectorless_local_graph_tool(definition: &ToolDefinition) -> bool {
+    definition
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("tokensave/localGraphNoSelectors"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
@@ -160,7 +252,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         graph_scoped(def_callees()),
         graph_scoped(def_impact()),
         graph_scoped(def_node()),
-        def_status(),
+        graph_scoped(def_status()),
         graph_scoped(def_files()),
         def_affected(),
         graph_scoped(def_dead_code()),
@@ -196,7 +288,10 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         def_str_replace(),
         def_multi_str_replace(),
         def_insert_at(),
+        def_delete_symbol(),
+        def_replace_lines(),
         def_ast_grep_rewrite(),
+        def_rename(),
         graph_scoped(def_gini()),
         graph_scoped(def_dependency_depth()),
         graph_scoped(def_health()),
@@ -251,6 +346,235 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         definitions.iter().all(|d| d.name.starts_with("tokensave_")),
         "all tool definitions must have 'tokensave_' prefix"
     );
+    definitions
+}
+
+/// The tools that [`Toolset::Core`](crate::config::Toolset::Core) lists (#576).
+///
+/// Exploration (`context`, `search`, `status`), reading (`read`, `body`,
+/// `files`), the call graph (`callers`, `callees`, `impact`) and the two
+/// string edits. Every `anthropic/alwaysLoad` tool must be here: those are the
+/// tools the server instructions send an agent to first.
+pub const CORE_TOOLS: &[&str] = &[
+    "tokensave_context",
+    "tokensave_search",
+    "tokensave_status",
+    "tokensave_read",
+    "tokensave_body",
+    "tokensave_files",
+    "tokensave_callers",
+    "tokensave_callees",
+    "tokensave_impact",
+    "tokensave_str_replace",
+    "tokensave_multi_str_replace",
+];
+
+/// The tool that lists more tools when the core toolset is active (#576).
+pub const MORE_TOOL: &str = "tokensave_more";
+
+/// The areas that [`MORE_TOOL`] can list: name, summary, tools.
+///
+/// The last area has no tool list. It is the catch-all: a tool that is not in
+/// [`CORE_TOOLS`] and not named by another area belongs to it, so a new tool
+/// is reachable without an edit here.
+pub const TOOL_AREAS: &[(&str, &str, &[&str])] = &[
+    (
+        "analysis",
+        "code-quality metrics and audits: complexity, coupling, cycles, dead code, hotspots, \
+         health, test risk and coverage, diagnostics, package dependencies",
+        &[
+            "tokensave_gini",
+            "tokensave_god_class",
+            "tokensave_dsm",
+            "tokensave_distribution",
+            "tokensave_redundancy",
+            "tokensave_hotspots",
+            "tokensave_complexity",
+            "tokensave_coupling",
+            "tokensave_circular",
+            "tokensave_largest",
+            "tokensave_rank",
+            "tokensave_health",
+            "tokensave_doc_coverage",
+            "tokensave_recursion",
+            "tokensave_test_risk",
+            "tokensave_test_coverage",
+            "tokensave_test_map",
+            "tokensave_simplify_scan",
+            "tokensave_unsafe_patterns",
+            "tokensave_dead_code",
+            "tokensave_unused_imports",
+            "tokensave_todos",
+            "tokensave_diagnostics",
+            "tokensave_diagnose",
+            "tokensave_inheritance_depth",
+            "tokensave_dependency_depth",
+            "tokensave_dependencies",
+        ],
+    ),
+    (
+        "edit",
+        "symbol-level and line-level edits, ast-grep rewrite, graph-based rename",
+        &[
+            "tokensave_insert_at",
+            "tokensave_delete_symbol",
+            "tokensave_replace_lines",
+            "tokensave_ast_grep_rewrite",
+            "tokensave_replace_symbol",
+            "tokensave_insert_at_symbol",
+            "tokensave_rename",
+        ],
+    ),
+    (
+        "git",
+        "commit, PR, diff, blame, log and changelog context, affected tests, tracked branches",
+        &[
+            "tokensave_changelog",
+            "tokensave_commit_context",
+            "tokensave_pr_context",
+            "tokensave_diff_context",
+            "tokensave_diff",
+            "tokensave_blame",
+            "tokensave_log",
+            "tokensave_affected",
+            "tokensave_run_affected_tests",
+            "tokensave_branch_search",
+            "tokensave_branch_diff",
+            "tokensave_branch_list",
+        ],
+    ),
+    (
+        "memory",
+        "session notes and recorded decisions",
+        &[
+            "tokensave_session_start",
+            "tokensave_session_end",
+            "tokensave_session_recall",
+            "tokensave_record_decision",
+            "tokensave_record_code_area",
+        ],
+    ),
+    (
+        "navigate",
+        "more symbol lookups: node, signature, implementations, type hierarchy, imports, \
+         call chains, field and constructor sites",
+        &[],
+    ),
+];
+
+/// The area of a tool that is not in [`CORE_TOOLS`].
+pub fn tool_area(name: &str) -> &'static str {
+    TOOL_AREAS
+        .iter()
+        .find(|(_, _, tools)| tools.contains(&name))
+        .or(TOOL_AREAS.last())
+        .map_or("navigate", |(area, _, _)| area)
+}
+
+/// A tool name for a hint in a tool result, with how to list it when the core
+/// toolset hides it (#576): `tokensave_doc (via tokensave_more area
+/// "navigate" if not listed)`. A core tool is returned as is.
+pub fn reachable_tool_name(name: &str) -> String {
+    if CORE_TOOLS.contains(&name) {
+        return name.to_string();
+    }
+    format!(
+        "{name} (via {MORE_TOOL} area \"{}\" if not listed)",
+        tool_area(name)
+    )
+}
+
+/// True when `area` is `"all"` or the name of an entry in [`TOOL_AREAS`].
+pub fn is_tool_area(area: &str) -> bool {
+    area == "all" || TOOL_AREAS.iter().any(|(name, _, _)| *name == area)
+}
+
+/// The `initialize` instructions sentence for the core toolset (#576): which
+/// tools are listed, and which areas [`MORE_TOOL`] can add.
+///
+/// A client that defers tool schemas (Claude Code) shows the model the server
+/// instructions before any schema, so this map is how a session learns that a
+/// tool it was told to use, such as `tokensave_node`, is one call away. It is
+/// sent once per session, not once per turn.
+pub fn core_toolset_instructions() -> String {
+    use std::fmt::Write;
+    let mut text = format!(
+        " Only the core tools are listed: {}. To list more, call {MORE_TOOL} with an area:",
+        CORE_TOOLS.join(", ")
+    );
+    for (area, summary, _) in TOOL_AREAS {
+        let _ = write!(text, " {area} ({summary}),");
+    }
+    text.push_str(" or all.");
+    text
+}
+
+fn def_more() -> ToolDefinition {
+    use std::fmt::Write;
+    let mut description = "List more tokensave tools. Only the core tools are listed at the \
+                           start, to keep the tool schemas small. Call this with an area, and \
+                           the tools of that area are listed from then on. Areas:"
+        .to_string();
+    let mut areas: Vec<&str> = Vec::new();
+    for (area, summary, _) in TOOL_AREAS {
+        let _ = write!(description, "\n• {area} — {summary}");
+        areas.push(area);
+    }
+    areas.push("all");
+    def(
+        MORE_TOOL,
+        "List More Tools",
+        &description,
+        json!({
+            "type": "object",
+            "properties": {
+                "area": { "type": "string", "enum": areas, "description": "The area to list, or \"all\"." }
+            },
+            "required": ["area"]
+        }),
+    )
+}
+
+/// Every tool an agent can be granted at install time: all of
+/// [`get_tool_definitions`] plus [`MORE_TOOL`].
+///
+/// `tokensave_more` is not in [`get_tool_definitions`] because the full
+/// toolset never lists it, but the core toolset is the default (#576), so a
+/// permission list without it prompts on the first call that lists more tools.
+pub fn get_installable_tool_definitions() -> Vec<ToolDefinition> {
+    let mut definitions = get_tool_definitions();
+    definitions.push(def_more());
+    definitions
+}
+
+/// Returns the tool definitions that `tools/list` sends for `toolset`.
+///
+/// [`get_tool_definitions`] stays the source of truth for everything else
+/// (dispatch, permission lists, the branch-drift gate): a tool that is not
+/// listed is hidden, not removed.
+///
+/// With [`Toolset::Core`](crate::config::Toolset::Core) the list is the core
+/// tools, the tools of each area in `revealed_areas`, and [`MORE_TOOL`] while
+/// an area is still hidden.
+pub fn get_listed_tool_definitions(
+    toolset: crate::config::Toolset,
+    revealed_areas: &std::collections::BTreeSet<String>,
+) -> Vec<ToolDefinition> {
+    let mut definitions = get_tool_definitions();
+    definitions.retain(|d| !is_hidden_tool(d));
+    if toolset == crate::config::Toolset::Full {
+        return definitions;
+    }
+    let all = revealed_areas.contains("all")
+        || TOOL_AREAS
+            .iter()
+            .all(|(area, _, _)| revealed_areas.contains(*area));
+    if !all {
+        definitions.retain(|d| {
+            CORE_TOOLS.contains(&d.name.as_str()) || revealed_areas.contains(tool_area(&d.name))
+        });
+        definitions.push(def_more());
+    }
     definitions
 }
 
@@ -328,7 +652,16 @@ fn def_search() -> ToolDefinition {
                 },
                 "literal": {
                     "type": "boolean",
-                    "description": "Exact-substring search over source text (for runtime error strings); returns file/line locations instead of ranked symbols. Case-sensitive. Default false."
+                    "description": "Exact-substring search over source text (for runtime error strings); returns file/line locations instead of ranked symbols, plus `total` matches and `truncated` when `limit` cut the list. Case-sensitive. Default false."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "description": "Output format. 'text' returns raw source with a short header (no JSON escaping); 'json' returns the structured object. Default 'text'."
+                },
+                "ids": {
+                    "type": "boolean",
+                    "description": "Include node IDs / enclosing IDs in results (both formats). Default false; pass true when you plan a follow-up call."
                 }
             },
             "required": ["query"]
@@ -664,7 +997,7 @@ fn def_files() -> ToolDefinition {
 }
 
 fn def_affected() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_affected",
         "Affected Tests",
         "Find test files affected by changed source files via dependency graph traversal. Returns a practical recommended suite plus classified direct, same-crate, cross-crate, transitive, and inline-test candidates.",
@@ -687,7 +1020,7 @@ fn def_affected() -> ToolDefinition {
             },
             "required": ["files"]
         }),
-    )
+    ))
 }
 
 fn def_ambiguous_calls() -> ToolDefinition {
@@ -770,7 +1103,7 @@ fn def_dead_code() -> ToolDefinition {
 }
 
 fn def_diff_context() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_diff_context",
         "Diff Context",
         "Given changed file paths, return semantic context: which symbols were modified, what depends on them, and affected tests.",
@@ -789,7 +1122,7 @@ fn def_diff_context() -> ToolDefinition {
             },
             "required": ["files"]
         }),
-    )
+    ))
 }
 
 fn def_module_api() -> ToolDefinition {
@@ -909,20 +1242,83 @@ fn def_similar() -> ToolDefinition {
     )
 }
 
+/// Hidden alias kept for callers of the pre-#568 tool: dispatches to
+/// `tokensave_rename` with `dry_run` forced on. Not sent in `tools/list`
+/// (see [`is_hidden_tool`]), but still a known tool for dispatch,
+/// permission lists and `tokensave tool`.
 fn def_rename_preview() -> ToolDefinition {
-    def(
+    hidden(def(
         "tokensave_rename_preview",
-        "References",
-        "Show all references to a symbol -- all edges where the node appears as source or target.",
+        "Rename Preview",
+        "Deprecated alias of tokensave_rename with dry_run=true: lists the rename sites of a \
+         symbol with their confidence class, without editing.",
         json!({
             "type": "object",
             "properties": {
                 "node_id": {
                     "type": "string",
-                    "description": "The unique node ID to find references for"
+                    "description": "The unique node ID to find rename sites for"
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "Optional new name, to include a diff preview"
                 }
             },
             "required": ["node_id"]
+        }),
+    ))
+}
+
+/// The `tokensave_rename` description. States what the tool is not, so a
+/// caller does not read a binding-aware guarantee into it (#568).
+pub const RENAME_DESCRIPTION: &str = "Rename a symbol at its definition and every reference \
+     the code graph records. Graph-based, NOT binding-aware: references come from a name-based \
+     resolver, not scope rules, so shadowing, dynamic calls or `**kwargs` can be missed. Each \
+     site has a class: `exact` = bound by a qualified path, typed receiver, import, or a name \
+     no other symbol has, located to one token; `heuristic` = a name fallback (`recv.method` \
+     tail, scoring among same-named candidates, blocklisted names, build variants), an \
+     override paired by name, or a token not distinguishable on its line; `ambiguous` = a call \
+     the resolver could not decide; `text_only` = a whole-word mention the graph does not link \
+     (comment, string, doc, unlinked identifier). Only indexed files are scanned. dry_run \
+     (default true) returns sites by file, counts per class and a unified diff. Applying \
+     refuses while any site is heuristic or ambiguous, or an unlinked identifier exists, unless \
+     allow_heuristic=true; ambiguous and text_only sites are never edited. All-or-nothing: \
+     every changed file must re-parse without new errors; keywords and same-scope collisions \
+     are refused.";
+
+fn def_rename() -> ToolDefinition {
+    def_rw(
+        "tokensave_rename",
+        "Rename Symbol",
+        RENAME_DESCRIPTION,
+        json!({
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "Node ID of the symbol to rename. Either this or `symbol`."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name or qualified name, resolved like tokensave_replace_symbol (callables win a tie; still ambiguous is refused)."
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "The new identifier. Required to apply; optional for a dry run."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Return the plan and diff without editing. Default true."
+                },
+                "allow_heuristic": {
+                    "type": "boolean",
+                    "description": "Also edit heuristic sites, instead of refusing while any exist. Default false."
+                },
+                "project_root": {
+                    "type": "string",
+                    "description": "Optional absolute directory to resolve the index-relative file paths against instead of the indexed project root, e.g. a checkout with the same layout. Alias: `cwd`."
+                }
+            }
         }),
     )
 }
@@ -964,7 +1360,7 @@ fn def_rank() -> ToolDefinition {
             "properties": {
                 "edge_kind": {
                     "type": "string",
-                    "enum": ["implements", "extends", "calls", "uses", "contains", "annotates", "derives_macro"],
+                    "enum": ["implements", "extends", "calls", "uses", "contains", "annotates", "derives_macro", "instantiates", "reopens"],
                     "description": "The relationship type to rank by (e.g. 'implements' to find most-implemented interfaces)"
                 },
                 "direction": {
@@ -1072,7 +1468,7 @@ fn def_distribution() -> ToolDefinition {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory or file path prefix to filter (e.g. 'src/main/java/com/example'). Omit for entire codebase."
+                    "description": "File or directory to filter to (e.g. 'src/main/java/com/example'). Omit for entire codebase."
                 },
                 "summary": {
                     "type": "boolean",
@@ -1139,7 +1535,7 @@ fn def_doc_coverage() -> ToolDefinition {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Directory or file path prefix to filter (e.g. 'src/main'). Omit for entire codebase."
+                    "description": "File or directory to filter to (e.g. 'src/main'). Omit for entire codebase."
                 },
                 "limit": {
                     "type": "number",
@@ -1203,11 +1599,11 @@ fn def_port_status() -> ToolDefinition {
             "properties": {
                 "source_dir": {
                     "type": "string",
-                    "description": "Path prefix for source code (e.g. 'src/python/')"
+                    "description": "Directory holding the source code (e.g. 'src/python/')"
                 },
                 "target_dir": {
                     "type": "string",
-                    "description": "Path prefix for target code (e.g. 'src/rust/')"
+                    "description": "Directory holding the target code (e.g. 'src/rust/')"
                 },
                 "kinds": {
                     "type": "array",
@@ -1230,7 +1626,7 @@ fn def_port_order() -> ToolDefinition {
             "properties": {
                 "source_dir": {
                     "type": "string",
-                    "description": "Path prefix for source code (e.g. 'src/python/')"
+                    "description": "Directory holding the source code (e.g. 'src/python/')"
                 },
                 "kinds": {
                     "type": "array",
@@ -1286,7 +1682,7 @@ fn def_pr_context() -> ToolDefinition {
 }
 
 fn def_simplify_scan() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_simplify_scan",
         "Simplify Scan",
         "Quality analysis of changed files: duplications, dead code, coupling, and complexity hotspots.",
@@ -1301,7 +1697,7 @@ fn def_simplify_scan() -> ToolDefinition {
             },
             "required": ["files"]
         }),
-    )
+    ))
 }
 
 fn def_test_map() -> ToolDefinition {
@@ -1435,7 +1831,11 @@ fn def_str_replace() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
+                },
+                "echo": {
+                    "type": "boolean",
+                    "description": "If true, echo the replaced/inserted text in the result. Default false."
                 }
             },
             "required": ["path", "old_str", "new_str"]
@@ -1471,7 +1871,7 @@ fn def_multi_str_replace() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 }
             },
             "required": ["path", "replacements"]
@@ -1509,7 +1909,11 @@ fn def_insert_at() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
+                },
+                "echo": {
+                    "type": "boolean",
+                    "description": "If true, echo the replaced/inserted text in the result. Default false."
                 }
             },
             "required": ["path", "anchor", "content"]
@@ -1518,6 +1922,45 @@ fn def_insert_at() -> ToolDefinition {
             "readOnlyHint": false,
             "title": "Insert Into File"
         })),
+        meta: None,
+    }
+}
+
+fn def_delete_symbol() -> ToolDefinition {
+    ToolDefinition {
+        name: "tokensave_delete_symbol".to_string(),
+        description: "Delete a symbol by qualified name, including its leading doc comment and one adjacent blank line. Resolves exactly like tokensave_replace_symbol; ambiguity is refused.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "symbol": { "type": "string", "description": "Qualified symbol name to delete" },
+                "include_doc_comment": { "type": "boolean", "description": "Include the leading doc comment/attribute block. Default true." },
+                "project_root": { "type": "string", "description": "Optional absolute directory to resolve a relative symbol-file path against. Alias: `cwd`." }
+            },
+            "required": ["symbol"]
+        }),
+        annotations: Some(json!({ "readOnlyHint": false, "title": "Delete Symbol" })),
+        meta: None,
+    }
+}
+
+fn def_replace_lines() -> ToolDefinition {
+    ToolDefinition {
+        name: "tokensave_replace_lines".to_string(),
+        description: "Replace a contiguous 1-based inclusive line range in a file. `expected_digest` (from tokensave_read) makes a stale range fail instead of corrupting the file; `new_content: \"\"` deletes the block.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Absolute or project-relative file path." },
+                "start": { "type": "number", "description": "1-based first line to replace." },
+                "end": { "type": "number", "description": "1-based last line to replace (inclusive)." },
+                "new_content": { "type": "string", "description": "Replacement text; empty string deletes the block." },
+                "expected_digest": { "type": "string", "description": "Optional SHA-256 digest of the file before the edit; fails if the file changed." },
+                "project_root": { "type": "string", "description": "Optional absolute directory to resolve a relative `path` against. Alias: `cwd`." }
+            },
+            "required": ["path", "start", "end", "new_content"]
+        }),
+        annotations: Some(json!({ "readOnlyHint": false, "title": "Replace Lines" })),
         meta: None,
     }
 }
@@ -1604,7 +2047,7 @@ fn def_runtime() -> ToolDefinition {
 }
 
 fn def_redundancy() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_redundancy",
         "Redundancy Hunt",
         "Find functionally duplicated function/method bodies via AST isomorphism, control-flow match, call-sequence match, and token-shingle Jaccard similarity. Each pair is bucketed as 'definite' (AST-identical), 'likely' (CFG or algorithmic match), or 'naming_only' (low confidence). Use when consolidating helpers or auditing code health. Computed lazily and cached per (node, body source hash) — first call on a fresh index can be slow on large repos.",
@@ -1633,7 +2076,7 @@ fn def_redundancy() -> ToolDefinition {
                 }
             }
         }),
-    )
+    ))
 }
 
 fn def_dsm() -> ToolDefinition {
@@ -1736,7 +2179,7 @@ fn def_annotations() -> ToolDefinition {
                 },
                 "file": {
                     "type": "string",
-                    "description": "Restrict to target nodes whose file_path starts with this prefix (file or directory)."
+                    "description": "Restrict to target nodes in this file or under this directory."
                 },
                 "target_kind": {
                     "type": "string",
@@ -1755,39 +2198,20 @@ fn def_dependencies() -> ToolDefinition {
     def(
         "tokensave_dependencies",
         "Package Dependencies",
-        "Inspect declared dependencies across all supported package ecosystems \
-         (#105, #106). Auto-detects which manifest(s) live at the project root:\n\
-         • Rust — Cargo.toml (+ workspace members glob, [target.<cfg>] deps, [patch.*]) + Cargo.lock\n\
-         • Node — package.json (+ npm/yarn/pnpm workspaces) + package-lock.json / yarn.lock / pnpm-lock.yaml\n\
-         • Python — pyproject.toml (PEP 621 + Poetry), requirements*.txt + poetry.lock / uv.lock / Pipfile.lock\n\
-         • Go — go.mod (require blocks, replace directives) + go.sum\n\
-         • Java — pom.xml (+ <modules> + <dependencyManagement> BOMs)\n\
-         • .NET — *.csproj/*.fsproj/*.vbproj + Directory.Packages.props + packages.lock.json\n\
-         • PHP — composer.json + composer.lock\n\
-         • Ruby — Gemfile + Gemfile.lock\n\
-         • Swift — Package.swift\n\
-         • Elixir — mix.exs\n\
-         • Erlang — rebar.config\n\
-         • R — DESCRIPTION\n\
-         • Haskell — *.cabal\n\
-         • OCaml — *.opam (+ dune-project fallback)\n\
-         • Dart/Flutter — pubspec.yaml + pubspec.lock\n\
-         • Crystal — shard.yml + shard.lock\n\
-         • Gradle — build.gradle (Groovy), build.gradle.kts (Kotlin), \
-         gradle/libs.versions.toml (Version Catalog), settings.gradle{,.kts} \
-         for multi-module discovery\n\n\
+        "Inspect declared dependencies. Auto-detects the manifests at the project root and in \
+         its workspace members for Rust, Node, Python, Go, Java (Maven), Gradle, .NET, PHP, Ruby, \
+         Swift, Elixir, Erlang, R, Haskell, OCaml, Dart/Flutter and Crystal. Polyglot repos \
+         return one block per ecosystem.\n\n\
          Three modes:\n\
          • zero input → workspace summary: members + every package any member \
-         depends on, plus `licenses` aggregate, `version_drift` array (crates \
+         depends on, plus `licenses` aggregate, `version_drift` array (packages \
          pinned at different versions across members), and `members_detail` \
-         with per-member license. Polyglot repos return one block per ecosystem.\n\
+         with per-member license.\n\
          • `crate: <name>` (or `package: <name>`) → list every member that \
          depends on this package, with kind/version/resolved/features/optional/local-path.\n\
          • `member: <name>` → list every dependency declared by this member.\n\n\
-         Filters: `ecosystem: rust|node|python|go|java|dotnet|php|ruby|swift|elixir|erlang|r|haskell|ocaml|dart|crystal|gradle`, \
-         `kind: normal|dev|build|peer|optional|all`. Set `include_lockfile: true` \
-         to stamp resolved versions from the per-ecosystem lockfile. Workspace \
-         globs support `crates/*`, `packages/*/foo`, `**`, and `!negation`.",
+         Filters: `ecosystem`, `kind`. Set `include_lockfile: true` to stamp resolved \
+         versions from the per-ecosystem lockfile.",
         json!({
             "type": "object",
             "properties": {
@@ -1809,11 +2233,11 @@ fn def_dependencies() -> ToolDefinition {
                 },
                 "ecosystem": {
                     "type": "string",
-                    "description": "Restrict to one ecosystem: \"rust\" / \"node\" / \"python\" / \"go\" / \"java\" / \"dotnet\" / \"php\" / \"ruby\"."
+                    "description": "Restrict to one ecosystem: rust, node, python, go, java, dotnet, php, ruby, swift, elixir, erlang, r, haskell, ocaml, dart, crystal or gradle."
                 },
                 "include_lockfile": {
                     "type": "boolean",
-                    "description": "When true, read the per-ecosystem lockfile (Cargo.lock, package-lock.json/yarn.lock, poetry.lock/uv.lock/Pipfile.lock, go.sum, packages.lock.json, composer.lock, Gemfile.lock) and add `resolved` versions alongside declared `version` ranges. Default false."
+                    "description": "When true, read each ecosystem's lockfile and add `resolved` versions alongside declared `version` ranges. Default false."
                 }
             }
         }),
@@ -1864,7 +2288,7 @@ fn def_test_coverage() -> ToolDefinition {
 }
 
 fn def_diagnose() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_diagnose",
         "Diagnose Cargo Output",
         "Parse raw `cargo check` / `cargo clippy` stderr text and map each \
@@ -1895,7 +2319,7 @@ fn def_diagnose() -> ToolDefinition {
             },
             "required": ["cargo_output"]
         }),
-    )
+    ))
 }
 
 fn def_run_affected_tests() -> ToolDefinition {
@@ -1954,7 +2378,7 @@ fn def_ast_grep_rewrite() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root. Use this when calling from a git worktree so relative paths land in the worktree, not the primary checkout. Ignored when `path` is absolute. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve a relative `path` against instead of the indexed project root, e.g. a git worktree. Ignored when `path` is absolute. Alias: `cwd`."
                 }
             },
             "required": ["path", "pattern", "rewrite"]
@@ -2005,20 +2429,32 @@ fn def_body() -> ToolDefinition {
         "Symbol Body",
         "Return the full source body of a symbol by name (function, struct, const, etc.). \
          Collapses search + node lookup + file read into a single call. \
-         When the name is ambiguous, returns multiple matches ranked by relevance.",
+         Returns a body only when exactly one definition matches; when the name is \
+         ambiguous (e.g. several methods named `RefreshAsync`), returns no body but a \
+         candidate list (qualified name, kind, file, line range, node id) — re-call with \
+         a qualified name such as `Type::Member` / `Type.Member`, or with `node_id`. \
+         A function or type definition outranks a same-named field or import.",
         json!({
             "type": "object",
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "Symbol name to look up (e.g. 'resolve_provider_api_key', 'CCH_SEED', 'GraphStats'). Qualified names are also accepted."
+                    "description": "Symbol name to look up (e.g. 'resolve_provider_api_key', 'GraphStats'). Qualify it to disambiguate: 'Coordinator::RefreshAsync', 'Coordinator.RefreshAsync' and 'App.Coordinator.RefreshAsync' all work (trailing segments are matched)."
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Node id of the symbol (from a candidate list, tokensave_search, or tokensave_context). Takes precedence over `symbol`."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Maximum number of matching bodies to return when the name is ambiguous (default: 3, max: 20)"
+                    "description": "Maximum number of candidates listed when the name is ambiguous (default: 20, max: 50)"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "description": "Output format. 'text' returns raw source with a short header (no JSON escaping); 'json' returns the structured object. Default 'text'."
                 }
-            },
-            "required": ["symbol"]
+            }
         }),
     )
 }
@@ -2195,7 +2631,7 @@ fn def_field_sites() -> ToolDefinition {
             "properties": {
                 "field": {
                     "type": "string",
-                    "description": "Field name. Bare name ('last_sync_at') matches across structs. The qualified form ('GraphStats::last_sync_at') narrows to that struct's field; sites whose receiver cannot be typed are reported in unattributed_count rather than listed, so a narrowed result is a lower bound."
+                    "description": "Field name. Bare name ('last_sync_at') matches across structs. The qualified form ('GraphStats::last_sync_at') narrows to that struct's field."
                 },
                 "writes_only": {
                     "type": "boolean",
@@ -2318,15 +2754,14 @@ fn def_config() -> ToolDefinition {
 }
 
 fn def_diagnostics() -> ToolDefinition {
-    def(
+    local_graph_no_selectors(def(
         "tokensave_diagnostics",
         "Compile / Type-Check Diagnostics",
         "Run the project's type-checker (cargo check for Rust, tsc for \
          TypeScript, pyright for Python) and return structured errors and \
          warnings. Each diagnostic includes file, line range, level, code, \
          message, driver, and the enclosing graph node when one can be \
-         resolved. Replaces the recurring 'run cargo → parse text → read \
-         file' loop with a single structured response. \
+         resolved. \
          \n\nNote: the cargo target dir is forced to .tokensave/target/ so \
          we don't race with the user's interactive cargo runs. The first \
          call against a fresh tree builds dependencies from scratch, which \
@@ -2352,7 +2787,7 @@ fn def_diagnostics() -> ToolDefinition {
                 }
             }
         }),
-    )
+    ))
 }
 
 fn def_unsafe_patterns() -> ToolDefinition {
@@ -2450,11 +2885,15 @@ fn def_read() -> ToolDefinition {
         "tokensave_read",
         "Read File (mode-aware)",
         "Read a file or its symbol map. Modes: 'full' (entire file), 'lines' \
-         (1-based inclusive byte-range slice via the 'lines' arg, e.g. '120-180'), \
+         (1-based inclusive line-range slice via the 'lines' arg, e.g. '120-180'), \
          'map' (flat list of every top-level symbol from the graph — no source \
          bytes touched), 'signatures' (functions and types with their cached \
-         signature). Cross-session cached: a re-call on an unchanged file returns \
-         a tiny stub with 'unchanged: true'.",
+         signature). 'full' and 'lines' number every line like the Read tool: \
+         right-aligned real file line number, a tab, then the line (a 'lines' \
+         slice from 120 starts at 120). The body is always returned, with a \
+         'digest' of it. To skip re-sending content you still hold, pass that \
+         digest as 'if_digest': when it matches the current body for the same \
+         mode and range, a tiny stub with 'unchanged: true' is returned instead.",
         json!({
             "type": "object",
             "properties": {
@@ -2470,6 +2909,19 @@ fn def_read() -> ToolDefinition {
                 "lines": {
                     "type": "string",
                     "description": "Required when mode='lines'. Format 'A-B' or single 'A' (1-based, inclusive). E.g. '120-180' or '42'."
+                },
+                "if_digest": {
+                    "type": "string",
+                    "description": "Digest from an earlier tokensave_read response with the same mode and range that you still hold. If it matches the current content, an 'unchanged: true' stub is returned instead of the body; otherwise the body is returned. Omit to always get the body."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Deprecated: the body is now always returned unless 'if_digest' matches. When true, 'if_digest' is ignored. Default false."
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["text", "json"],
+                    "description": "Output format. 'text' returns raw source with a short header (no JSON escaping); 'json' returns the structured object. Default 'text'."
                 }
             },
             "required": ["file"]
@@ -2549,7 +3001,11 @@ fn def_replace_symbol() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory the symbol's (index-relative) file path is resolved against instead of the indexed project root. Use this when calling from a git worktree that shares the same relative layout but lives at a different absolute location, so the write lands in the worktree, not the primary checkout. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve the symbol's index-relative file path against instead of the indexed project root, e.g. a git worktree with the same layout. Alias: `cwd`."
+                },
+                "echo": {
+                    "type": "boolean",
+                    "description": "If true, echo the replaced/inserted text in the result. Default false."
                 }
             },
             "required": ["symbol", "new_source"]
@@ -2608,7 +3064,11 @@ fn def_insert_at_symbol() -> ToolDefinition {
                 },
                 "project_root": {
                     "type": "string",
-                    "description": "Optional absolute directory the symbol's (index-relative) file path is resolved against instead of the indexed project root. Use this when calling from a git worktree that shares the same relative layout but lives at a different absolute location, so the write lands in the worktree, not the primary checkout. Alias: `cwd`."
+                    "description": "Optional absolute directory to resolve the symbol's index-relative file path against instead of the indexed project root, e.g. a git worktree with the same layout. Alias: `cwd`."
+                },
+                "echo": {
+                    "type": "boolean",
+                    "description": "If true, echo the replaced/inserted text in the result. Default false."
                 }
             },
             "required": ["symbol", "content"]
@@ -2677,7 +3137,15 @@ fn def_diff() -> ToolDefinition {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::unreadable_literal)]
 mod tests {
     use super::*;
-    use crate::mcp::server::LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS;
+    /// The drift gate's refused set, derived from the registry the same way
+    /// the server derives it at construction.
+    fn derived_selectorless_refused_tools() -> BTreeSet<String> {
+        get_tool_definitions()
+            .iter()
+            .filter(|definition| is_selectorless_local_graph_tool(definition))
+            .map(|definition| definition.name.clone())
+            .collect()
+    }
     use std::collections::BTreeSet;
 
     fn canonical_graph_scoped_tools() -> BTreeSet<&'static str> {
@@ -2688,6 +3156,7 @@ mod tests {
             "tokensave_callees",
             "tokensave_impact",
             "tokensave_node",
+            "tokensave_status",
             "tokensave_files",
             "tokensave_dead_code",
             "tokensave_ambiguous_calls",
@@ -2752,12 +3221,15 @@ mod tests {
             "tokensave_changelog",
             "tokensave_commit_context",
             "tokensave_config",
+            "tokensave_delete_symbol",
             "tokensave_dependencies",
             "tokensave_diff",
+            "tokensave_rename",
             "tokensave_insert_at",
             "tokensave_insert_at_symbol",
             "tokensave_log",
             "tokensave_multi_str_replace",
+            "tokensave_replace_lines",
             "tokensave_port_order",
             "tokensave_port_status",
             "tokensave_pr_context",
@@ -2769,7 +3241,6 @@ mod tests {
             "tokensave_session_end",
             "tokensave_session_recall",
             "tokensave_session_start",
-            "tokensave_status",
             "tokensave_str_replace",
         ]
         .into_iter()
@@ -2778,6 +3249,137 @@ mod tests {
             tools.insert("tokensave_ast_grep_rewrite");
         }
         tools
+    }
+
+    /// #576: a client sends every tool description on every turn, so a long
+    /// one is a fixed cost for the whole session. `tokensave_dependencies`
+    /// was 1.9 KB because it listed every manifest and lockfile name. Details
+    /// like that belong in the tool result or in the parameter that needs them.
+    #[test]
+    fn tool_descriptions_stay_within_their_byte_budget() {
+        for definition in get_tool_definitions() {
+            assert!(
+                definition.description.len() <= 1200,
+                "{} description is {} bytes",
+                definition.name,
+                definition.description.len()
+            );
+        }
+    }
+
+    /// #576: a hint naming a hidden tool says which area lists it; a core tool
+    /// needs no such note.
+    #[test]
+    fn a_hint_names_the_area_that_lists_a_hidden_tool() {
+        assert_eq!(
+            reachable_tool_name("tokensave_doc"),
+            "tokensave_doc (via tokensave_more area \"navigate\" if not listed)"
+        );
+        assert_eq!(
+            reachable_tool_name("tokensave_blame"),
+            "tokensave_blame (via tokensave_more area \"git\" if not listed)"
+        );
+        assert_eq!(reachable_tool_name("tokensave_search"), "tokensave_search");
+    }
+
+    /// #576: the core toolset lists exactly `CORE_TOOLS`, every name in it is a
+    /// real tool, and it keeps every tool the instructions point an agent at.
+    #[test]
+    fn the_core_toolset_lists_only_the_core_tools() {
+        use crate::config::Toolset;
+        let all = get_tool_definitions();
+        for name in CORE_TOOLS {
+            assert!(all.iter().any(|d| d.name == *name), "{name} is not a tool");
+        }
+        let none = std::collections::BTreeSet::new();
+        let core = get_listed_tool_definitions(Toolset::Core, &none);
+        assert_eq!(core.len(), CORE_TOOLS.len() + 1);
+        assert!(core
+            .iter()
+            .all(|d| CORE_TOOLS.contains(&d.name.as_str()) || d.name == MORE_TOOL));
+        for definition in get_always_load_tool_definitions() {
+            assert!(
+                CORE_TOOLS.contains(&definition.name.as_str()),
+                "{} is alwaysLoad but not core",
+                definition.name
+            );
+        }
+        // Hidden aliases (`tokensave_rename_preview`) are dispatched but
+        // never listed.
+        let listed = all.iter().filter(|d| !is_hidden_tool(d)).count();
+        assert!(listed < all.len());
+        assert_eq!(
+            get_listed_tool_definitions(Toolset::Full, &none).len(),
+            listed
+        );
+    }
+
+    /// #576: each area names real tools only, no tool is in two areas or in
+    /// the core set as well, and the areas together reach every tool. When
+    /// every area is listed the list equals the full one, without `MORE_TOOL`.
+    #[test]
+    fn the_tool_areas_partition_the_tools_outside_the_core_set() {
+        use crate::config::Toolset;
+        use std::collections::BTreeSet;
+        let all = get_tool_definitions();
+        let mut seen = BTreeSet::new();
+        for (area, _, tools) in TOOL_AREAS {
+            for tool in *tools {
+                // Registered only when the `ast-grep` binary is on PATH.
+                if *tool == "tokensave_ast_grep_rewrite" && !ast_grep_available() {
+                    continue;
+                }
+                assert!(
+                    all.iter().any(|d| d.name == *tool),
+                    "{area}: {tool} is not a tool"
+                );
+                assert!(!CORE_TOOLS.contains(tool), "{tool} is core and in {area}");
+                assert!(seen.insert(*tool), "{tool} is in two areas");
+                assert_eq!(tool_area(tool), *area);
+            }
+        }
+        assert_eq!(tool_area("tokensave_node"), "navigate");
+        assert!(is_tool_area("all") && is_tool_area("git") && !is_tool_area("nope"));
+
+        let mut total = CORE_TOOLS.len();
+        for (area, _, _) in TOOL_AREAS {
+            let one = BTreeSet::from([(*area).to_string()]);
+            let listed = get_listed_tool_definitions(Toolset::Core, &one);
+            assert!(listed.iter().any(|d| d.name == MORE_TOOL));
+            total += listed.len() - CORE_TOOLS.len() - 1;
+        }
+        let listable = all.iter().filter(|d| !is_hidden_tool(d)).count();
+        assert_eq!(total, listable, "the areas must reach every tool once");
+
+        let everything = BTreeSet::from(["all".to_string()]);
+        let listed = get_listed_tool_definitions(Toolset::Core, &everything);
+        assert_eq!(listed.len(), listable);
+        assert!(listed.iter().all(|d| d.name != MORE_TOOL));
+    }
+
+    /// #576: the selector docs are copied into every graph-scoped schema, so
+    /// their size is multiplied by the number of such tools on every turn.
+    /// Hold the short form to a budget, and make sure the rules it dropped
+    /// are still sent once in the server instructions.
+    #[test]
+    fn graph_selector_docs_stay_within_their_byte_budget() {
+        for text in [
+            GRAPH_ROOT_DESCRIPTION,
+            GRAPH_ROOT_FEDERATED_DESCRIPTION,
+            GRAPH_BRANCH_DESCRIPTION,
+        ] {
+            assert!(text.len() <= 130, "{} bytes: {text}", text.len());
+        }
+        assert!(GRAPH_ROOT_FEDERATED_DESCRIPTION.contains("array of roots"));
+        assert!(!GRAPH_ROOT_DESCRIPTION.contains("array"));
+        for rule in [
+            "array of roots",
+            "worktrees",
+            "rejects an array",
+            "graph_branch",
+        ] {
+            assert!(GRAPH_SELECTOR_INSTRUCTIONS.contains(rule), "{rule}");
+        }
     }
 
     #[test]
@@ -2834,13 +3436,21 @@ mod tests {
                 );
                 assert_eq!(
                     graph_root.unwrap()["description"],
-                    "Exact absolute initialized project root to query. Omit to query the \
-                     project this server already serves; when present it must name a different \
-                     project. `tokensave_search` and `tokensave_files` also accept an array of \
-                     roots and answer across all of them at once, interleaving results by rank; \
-                     roots that are worktrees of a repository already named are collapsed, and \
-                     the response says which. Every other tool answers about a single graph and \
-                     rejects an array.",
+                    super::graph_root_description(&definition.name),
+                    "{}",
+                    definition.name
+                );
+                // #576: the array rule reaches only the two tools that honour
+                // it, so the other 51 do not pay for it on every turn.
+                assert_eq!(
+                    graph_root.unwrap()["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("array"),
+                    matches!(
+                        definition.name.as_str(),
+                        "tokensave_search" | "tokensave_files"
+                    ),
                     "{}",
                     definition.name
                 );
@@ -2852,7 +3462,7 @@ mod tests {
                 );
                 assert_eq!(
                     graph_branch.unwrap()["description"],
-                    "Exact tracked branch to query within graph_root. Requires graph_root.",
+                    GRAPH_BRANCH_DESCRIPTION,
                     "{}",
                     definition.name
                 );
@@ -2874,7 +3484,7 @@ mod tests {
             .filter(|definition| is_graph_scoped_tool(definition))
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(actual.len(), 52);
+        assert_eq!(actual.len(), 53);
         assert_eq!(actual, canonical);
     }
 
@@ -2883,39 +3493,39 @@ mod tests {
         let definitions = get_tool_definitions();
         let all_registered = definitions
             .iter()
-            .map(|definition| definition.name.as_str())
+            .map(|definition| definition.name.clone())
             .collect::<BTreeSet<_>>();
         let selector_capable = definitions
             .iter()
             .filter(|definition| is_graph_scoped_tool(definition))
-            .map(|definition| definition.name.as_str())
+            .map(|definition| definition.name.clone())
             .collect::<BTreeSet<_>>();
-        let exempt_selectorless = canonical_selectorless_drift_exempt_tools();
-        let refused_selectorless = LOCAL_GRAPH_TOOLS_NOT_SUPPORTING_SELECTORS
-            .iter()
-            .copied()
+        let exempt_selectorless = canonical_selectorless_drift_exempt_tools()
+            .into_iter()
+            .map(str::to_string)
             .collect::<BTreeSet<_>>();
+        let refused_selectorless = derived_selectorless_refused_tools();
 
         let multiply_classified = selector_capable
             .intersection(&refused_selectorless)
             .chain(selector_capable.intersection(&exempt_selectorless))
             .chain(refused_selectorless.intersection(&exempt_selectorless))
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
         let classified = selector_capable
             .union(&refused_selectorless)
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>()
             .union(&exempt_selectorless)
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
         let added_unclassified = all_registered
             .difference(&classified)
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
         let removed_stale = classified
             .difference(&all_registered)
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
 
         assert!(
@@ -2924,6 +3534,31 @@ mod tests {
                 && multiply_classified.is_empty(),
             "drift classification mismatch: added/unclassified={added_unclassified:?}, \
              removed/stale={removed_stale:?}, multiply classified={multiply_classified:?}"
+        );
+    }
+
+    #[test]
+    fn selectorless_refusal_set_is_derived_and_covers_the_known_six() {
+        // The branch-drift gate refuses this exact set today; deriving it
+        // from the registry marker must reproduce the same membership, and
+        // any future selector-less local graph tool must appear here
+        // automatically instead of silently escaping the gate.
+        let derived = derived_selectorless_refused_tools();
+        let expected: BTreeSet<String> = [
+            "tokensave_affected",
+            "tokensave_diff_context",
+            "tokensave_simplify_scan",
+            "tokensave_redundancy",
+            "tokensave_diagnostics",
+            "tokensave_diagnose",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert!(
+            expected.is_subset(&derived),
+            "derived selector-less refusal set lost members: missing={:?}",
+            expected.difference(&derived).collect::<Vec<_>>()
         );
     }
 

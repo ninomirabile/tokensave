@@ -266,7 +266,7 @@ impl Database {
         }
 
         // Fallback: LIKE query
-        let like_pattern = format!("%{query}%");
+        let like_pattern = format!("%{}%", escape_like(query));
         let mut rows = self
             .conn()
             .query(
@@ -274,7 +274,7 @@ impl Database {
                     start_line, end_line, start_column, end_column,
                     docstring, signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
                  FROM nodes
-                 WHERE name LIKE ?1 OR qualified_name LIKE ?1 OR docstring LIKE ?1 OR signature LIKE ?1
+                 WHERE name LIKE ?1 ESCAPE '\\' OR qualified_name LIKE ?1 ESCAPE '\\' OR docstring LIKE ?1 ESCAPE '\\' OR signature LIKE ?1 ESCAPE '\\'
                  LIMIT ?2",
                 params![like_pattern.as_str(), limit as i64],
             )
@@ -503,6 +503,16 @@ impl Database {
             })?;
 
         collect_rows(&mut rows, row_to_node, "search_nodes_by_exact_name").await
+    }
+
+    /// Returns `true` if the error is a failed schema migration (see
+    /// [`crate::db::migrations::MIGRATION_FAILED`]).
+    pub fn is_migration_error(e: &TokenSaveError) -> bool {
+        matches!(
+            e,
+            TokenSaveError::Database { operation, .. }
+                if operation == crate::db::migrations::MIGRATION_FAILED
+        )
     }
 
     /// Returns `true` if the error indicates `SQLite` database corruption.

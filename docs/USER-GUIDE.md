@@ -199,6 +199,20 @@ If your project contains code in hidden directories (e.g., `.github/scripts/`), 
 }
 ```
 
+#### Indexing a gitignored path
+
+`include` does not override `.gitignore`. To index one specific path that a `.gitignore` rule covers (for example generated code inside one repo of a multi-repo workspace) without turning gitignore handling off for the whole project, list it in `force_include`:
+
+```json
+{
+  "force_include": [
+    "services/api/generated/**"
+  ]
+}
+```
+
+Only files matching these globs are un-ignored; every other `.gitignore` rule keeps applying. The walk starts at the glob's leading literal directories (`services/api/generated` above), so prefer a specific prefix over a leading `**`. `exclude` globs still win over `force_include`, and the size limit still applies. Hidden paths the glob names are admitted too, so `include` is not needed alongside it.
+
 ---
 
 ## Connecting to Your Agent
@@ -211,7 +225,9 @@ Tokensave works as an MCP (Model Context Protocol) server. AI coding agents conn
 tokensave install
 ```
 
-This is the default. It registers the MCP server in `~/.claude/settings.json`, grants tool permissions so Claude doesn't have to ask you every time, installs a `PreToolUse` hook that redirects Claude away from spawning expensive Explore agents and away from symbol-shaped grep/rg searches that a tokensave tool answers more cheaply, and adds prompt rules to `~/.claude/CLAUDE.md` that tell Claude to prefer tokensave tools.
+This is the default. It registers the MCP server in `~/.claude/settings.json`, grants tool permissions so Claude doesn't have to ask you every time, installs a `PreToolUse` hook that redirects Claude away from spawning expensive Explore agents and away from symbol-shaped grep/rg searches that a tokensave tool answers more cheaply, and writes prompt rules to `~/.claude/rules/tokensave.md` that tell Claude to prefer tokensave tools.
+
+That rules file is rewritten on install and on upgrade so improvements to the rules reach you. To add rules of your own, write them below its last line (the `tokensave-managed rules end here` marker): text there is kept on every refresh. To keep the whole file as yours, for example a team-maintained version, set `manage_rules = false` in `~/.tokensave/config.toml`. Install, reinstall, the upgrade resync and uninstall then leave every tokensave rules file alone, and `doctor` reports it as user-managed. `TOKENSAVE_MANAGE_RULES=0` does the same for one run.
 
 By default the tool grant is an explicit list (one `permissions.allow` entry per tool). Pass `--wildcard-permissions` to grant them via a single compact `mcp__tokensave__*` entry instead — both forms are fully honored by Claude Code, so this is purely a preference. The choice is remembered in `~/.tokensave/config.toml` (`wildcard_permissions`) for global installs; pass `--explicit-permissions` to switch back.
 
@@ -240,6 +256,13 @@ tokensave install --agent grok        # Grok Build (xAI)
 tokensave install --agent auggie      # AugmentCode
 tokensave install --agent pi          # Pi (pi.dev)
 tokensave install --agent plank       # Plank (macOS only)
+```
+
+Repeat `--agent` to install several agents in one run — the permission grant
+and the git-hook prompt only fire once per command:
+
+```bash
+tokensave install --agent claude --agent cursor --agent droid
 ```
 
 You can also pre-decide the global git `post-commit` hook prompt — useful in
@@ -343,6 +366,10 @@ tokensave serve
 ```
 
 This starts the MCP server over stdio. You normally don't need to run this yourself — the agent integration handles it. But it's useful for debugging or connecting custom tools.
+
+#### Starting outside a project
+
+If `serve` starts in a folder that is not inside an indexed project (a scratch folder, a session with no project, or `-p` pointing at a folder with no index), it no longer exits. It starts with **no default project**: `initialize` succeeds and lists the registered projects, and every tool call passes `graph_root` with one of them. `tokensave_status` without `graph_root` answers with that list. Any other call without `graph_root` gets an error that names the registered projects. An explicit `-p` without an index never falls back to another project; without `-p`, the only registered project is still served as before.
 
 ### Working from a subdirectory
 
@@ -717,7 +744,6 @@ being asked would be a bad surprise. Nothing new is detected when you enable
 it — the same conditions were already detected, this only changes whether they
 warn or refuse.
 
-
 ### CLI-Only Workflows
 
 If you don't keep an agent attached, no MCP server is running to refresh the
@@ -816,6 +842,12 @@ tokensave affected src/lib.rs --quiet            # just file paths, no decoratio
 
 When running as an MCP server, tokensave exposes more than 80 tools that AI agents can call. The most commonly used are grouped below by purpose; run `tokensave tool` for the complete list with one-line descriptions.
 
+### Listing fewer tools
+
+A client sends the schema of every listed tool on every turn, before any tool is called, so the full list costs context whether or not the tools are used. By default the server lists 11 core tools: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace`, plus `tokensave_more`, which lists the tools of one area (`analysis`, `edit`, `git`, `memory`, `navigate`, or `all`) for the rest of the session. The server announces the change, so the client fetches the list again. The `initialize` instructions name the core tools and the areas, so an agent that has not seen a tool's schema still knows how to reach it.
+
+The setting chooses what is listed, not what runs: a tool that is not listed still answers a call, so permission lists and hooks keep working. To list every tool, set `"tools": "full"` in `.tokensave/config.json` or `TOKENSAVE_TOOLS=full` (the environment variable wins). A `"tools": "full"` written by 7.13.0, which wrote that value into every config it saved, is read as the old default; set it again after upgrading to keep the full list.
+
 ### Core exploration
 
 | Tool | What it does |
@@ -880,7 +912,20 @@ only files you asked about and the index could not answer for.
 | `tokensave_impact` | Trace the full blast radius of changing a symbol — everything that could be affected. |
 | `tokensave_affected` | Find test files affected by source file changes. |
 | `tokensave_similar` | Find symbols with similar names (useful for naming patterns or related code). |
-| `tokensave_rename_preview` | Preview all references to a symbol before renaming it. |
+| `tokensave_rename` | Rename a symbol at its definition and at every reference the graph records. Dry run by default: lists the sites by file with a confidence class and shows a unified diff. Graph-based, not binding-aware — see [Renaming a symbol](#renaming-a-symbol). The old `tokensave_rename_preview` name still works as a dry-run alias. |
+
+#### Renaming a symbol
+
+`tokensave_rename` renames a symbol at its definition and at every reference the code graph records. It is graph-based, **not binding-aware**: references come from tokensave's name-based resolver, not from each language's scope rules, so a shadowing local, a dynamic call or a `**kwargs` splat can be missed or attributed to the wrong symbol. Each site carries a confidence class, taken from how the resolver bound it (`resolved_by`, stored on every edge since schema v18):
+
+| Class | Meaning | Edited? |
+|-------|---------|---------|
+| `exact` | Bound by a qualified path, a typed receiver, an import, or a name no other symbol carries, and located to one token | Yes |
+| `heuristic` | Bound by a name-based fallback (the tail of `recv.method`, scoring among same-named candidates, a blocklisted common name, a build variant), an override paired by name, or a token that could not be told apart from another on the same line | Only with `allow_heuristic: true` |
+| `ambiguous` | A call the resolver could not decide between this symbol and others | Never |
+| `text_only` | A whole-word mention the graph does not link: a comment, string, doc, or an unlinked identifier in code | Never |
+
+A dry run (the default) returns the plan and a unified diff. Applying refuses while any site is `heuristic` or `ambiguous`, or an unlinked identifier mentions the name, unless `allow_heuristic` is set. The apply is all-or-nothing: every edited file must still parse with tree-sitter without new error nodes, keywords and non-identifiers are refused, and so is a name already used in the same scope. Mentions past the listing cap are counted but not listed, and they still gate an apply, as does a file that mentions the name but is too large or unreadable to check. Lines and columns are 1-based; a column counts bytes, not characters. Only indexed files are scanned, so a file the indexer skips (over `max_file_size`, 1 MB by default, or excluded) is not checked for mentions. Writes follow symlinks, including links that point outside the project: the target file is edited and the link is kept. The edited files are reindexed together and their references re-resolved, so the renamed symbol keeps its callers.
 
 ### Code quality analysis
 
@@ -963,6 +1008,103 @@ Discovery and analysis tools are read-only and safe to call in parallel. Session
 
 ---
 
+## Finding missed opportunities: `tokensave discover`
+
+`tokensave discover` looks back over ingested Claude Code turns and reports
+navigation a graph query could have served more cheaply.
+
+```bash
+tokensave discover                 # last 30 days
+tokensave discover --since 7d      # today, 7d, 30d, month, all
+tokensave discover --json
+```
+
+A turn is counted only when **every** tool it used was `Read`, `Grep` or
+`Glob`. A turn that also edited a file, ran Bash or delegated to an agent is
+left out entirely, so an edit turn's cost is never attributed to navigation.
+Turns are bucketed by the strongest signal present, `Grep` over `Glob` over
+`Read`, and each bucket names the tokensave query that would have answered the
+same question.
+
+### Reading the two token columns
+
+**Addressable** is the size of the tool results those turns injected into the
+conversation — the text a graph query could have returned more compactly. It is
+measured from the transcript, per `tool_result` block.
+
+**Recoverable** is half of that, and is a deliberately conservative lower
+bound rather than a measurement. A graph query is not free: it returns a
+compact slice where a `Read` returned a whole file, so it replaces most of the
+payload rather than all of it.
+
+Three limits are worth knowing, because each one makes the report an
+under-count rather than an over-claim:
+
+- Bash-based navigation (`grep`, `find`, `cat`, `rg`) is invisible here. Only
+  the literal tool name `Bash` is recorded, never the command text, so those
+  turns are not counted at all.
+- Turns ingested before tokensave 7.11.1 carry no measured result size and
+  contribute nothing. The figure comes from transcript lines the database does
+  not keep, so it is not backfilled; a range reaching back before you upgraded
+  will say so rather than printing a bare zero.
+- Only Claude Code turns are analyzed.
+
+Before 7.11.1 the addressable column summed a turn's `input_tokens`, which
+under prompt caching is only the uncached remainder of the prompt — a
+single-digit figure per turn that had nothing to do with what a `Read` put into
+the conversation (#474).
+
+---
+
+## Auditing resolution quality: `tokensave audit-edges`
+
+When tokensave binds a reference to a symbol it cannot actually reach, the
+result is a *phantom edge*: the graph asserts a relationship the code does not
+have. `audit-edges` counts them.
+
+```bash
+tokensave audit-edges              # human-readable summary
+tokensave audit-edges --top 25     # list more of the collided targets
+tokensave audit-edges --json
+```
+
+```
+Edge audit — /path/to/project
+  total edges                          21454
+  in gated languages (py/js/ts)        18022
+    cross-file                          9310
+    sole-candidate                      1533
+      without reachability evidence      485   <- diff this between commits
+
+Most-collided targets:
+     218 edges from  147 files  src/controllers/help_tab.py:478  p (function)
+      36 edges from   22 files  src/helpers/instructions_posture.py:741  total (method)
+```
+
+**Read the last figure comparatively, not absolutely.** It is meaningful as a
+difference between two indexes of the same tree — index one commit, index
+another, compare — which is how a change to resolution is evaluated. A single
+number in isolation says little, because some collisions are legitimate.
+
+An edge is counted when all of these hold: the source file is Python,
+JavaScript or TypeScript (the languages where a bare name alone is not evidence
+of a binding); the edge crosses a file boundary; the target is the *only*
+symbol of that name in the whole index; and the source file carries no evidence
+it can reach the target — not the same directory, not importing that name, not
+importing the class that owns it.
+
+The "most-collided targets" list is usually the more actionable half. A short
+name on a nested helper — `p`, `total`, `files`, `right` — becomes the sole
+candidate for every stray reference to that name in the project, so one
+badly-placed closure can absorb hundreds of edges.
+
+This deliberately does not classify files as production or test. An earlier
+metric counted edges crossing into `tests/`, which cannot see a phantom whose
+two ends are both production code — on one 515-file project that was 485 of
+1,216 such edges, invisible (#536).
+
+---
+
 ## Supported Languages
 
 Tokensave supports more than 50 languages, organized into three tiers. Each tier includes all the languages from the tier below it. See the README for the full table with file extensions and feature flags.
@@ -977,13 +1119,13 @@ Rust, Go, Java, Scala, TypeScript, JavaScript, Python, C, C++, Kotlin, C#, Swift
 
 Adds scripting, config, and additional systems languages.
 
-Dart, Pascal, PHP, Ruby, Bash, Protobuf, PowerShell, Nix, VB.NET
+Dart, Pascal, PHP, Ruby (including `.rake` task files), Bash, Protobuf, PowerShell, Nix, VB.NET
 
 ### Full (Medium + everything else, the default)
 
 Everything: legacy, niche, shader, and document languages.
 
-ActionScript, Lua, Zig, Objective-C, Perl, Batch/CMD, Fortran, COBOL, MS BASIC 2.0, GW-BASIC, QBasic, QuickBASIC 4.5, Dockerfile, GLSL, WGSL, HLSL, Metal, Markdown, R, SQL, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, F#, F*, Quint, TOML, Lean
+ActionScript, Lua, Zig, Objective-C, Perl, Batch/CMD, Fortran, COBOL, MS BASIC 2.0, GW-BASIC, QBasic, QuickBASIC 4.5, Dockerfile, GLSL, WGSL, HLSL, Metal, Markdown, R, SQL, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, F#, F*, Quint, TOML, Lean, SystemVerilog, VHDL
 
 ### Mixing individual languages
 
@@ -1053,6 +1195,21 @@ The `upgrade` command downloads the latest release from GitHub and replaces the 
 tokensave upgrade
 ```
 
+Every download is checked against the `SHA256SUMS` file published with the
+release, before it is unpacked. If the hash does not match, or the release
+publishes no sums file at all, the upgrade **stops and installs nothing**:
+
+```
+✘ downloaded archive does not match the SHA256 published for it — refusing to install.
+```
+
+That is deliberate rather than cautious. Skipping the check when the sums file
+is simply missing would mean anyone able to suppress one small file gets an
+unverified install, which is the whole thing the check exists to prevent. If you
+see this, retry — a release whose CI has not finished may not have published
+its sums yet. Checksums protect against a corrupted or substituted download;
+they are not a signature, so they cannot vouch for the release pipeline itself.
+
 Beta and stable are separate update channels — a beta build only sees beta releases and vice versa. Any attached MCP servers will continue running with the previous binary until you restart your agent.
 
 If other tokensave processes (usually MCP servers) are running, `upgrade` lists them and asks whether to kill them first. Pass `--kill` to terminate them without being asked:
@@ -1071,7 +1228,7 @@ scoop update tokensave          # Scoop
 cargo install tokensave         # Cargo
 ```
 
-Upgrades are zero-touch: you normally do **not** need to re-run `install` or `sync --force` by hand. Tokensave compares the version that last ran against the running one and performs exactly the maintenance that transition requires — refreshing every registered agent's config on a minor or major bump, and rebuilding project indexes on a major one. That refresh is silent; it will not print install output in front of your next `init` or `sync`. See [TOKENSAVE-VERSIONING.md](../TOKENSAVE-VERSIONING.md) for the full rules.
+Upgrades are zero-touch: you normally do **not** need to re-run `install` or `sync --force` by hand. Tokensave compares the version that last ran against the running one and performs exactly the maintenance that transition requires — refreshing every registered agent's config on a minor or major bump, and rebuilding project indexes on a major one. That refresh is silent; it will not print install output in front of your next `init` or `sync`. It also rewrites tokensave's own section of any git hooks already installed (the global ones, and the current repository's), so hook fixes reach you too; it never installs a hook you didn't have. `tokensave reinstall` does the same on demand, and `doctor` reports a hook whose tokensave section is out of date. See [TOKENSAVE-VERSIONING.md](../TOKENSAVE-VERSIONING.md) for the full rules.
 
 The two cases where you should still step in:
 
@@ -1085,6 +1242,14 @@ tokensave sync --force # to rebuild an index you suspect is wrong
 ## Configuration Files
 
 Tokensave stores data in two places.
+
+### Configuration and environment overrides
+
+`.tokensave/config.json` is generated as ordinary JSON. It includes an
+`_comment` metadata field explaining that `TOKENSAVE_*` environment variables
+override matching config values when set. This is especially relevant for
+`TOKENSAVE_AUTO_TRACK`, `TOKENSAVE_REPORT_SAVINGS`, and
+`TOKENSAVE_UPDATE_CHECK`.
 
 ### Per-project: `.tokensave/`
 
@@ -1197,6 +1362,7 @@ upload_enabled = true        # set to false to stop uploading
 watcher_debounce = "2s"      # inert; left over from the watcher removed in 6.1.1
 extraction_timeout_secs = 60 # per-file extraction timeout
 wildcard_permissions = false # true = grant Claude Code tools via one "mcp__tokensave__*" entry
+manage_rules = true          # false = leave ~/.claude/rules/tokensave.md and other rules files to you
 ```
 
 `state.toml` holds everything else (`pending_upload`, `last_upload_at`,

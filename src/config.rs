@@ -10,6 +10,14 @@ use crate::errors::{Result, TokenSaveError};
 /// Name of the configuration file stored inside the `.tokensave` directory.
 pub const CONFIG_FILENAME: &str = "config.json";
 
+/// Schema version of `config.json`.
+///
+/// Version 2 (#576) changed the default toolset from full to core and stopped
+/// writing `tools` when it is unset. Version 1 wrote `"tools": "full"` into
+/// every config it saved, so [`load_config`] reads that value in a version 1
+/// file as the old default rather than as a choice.
+pub const CONFIG_VERSION: u32 = 2;
+
 /// Name of the hidden directory used to store `TokenSave` metadata.
 pub const TOKENSAVE_DIR: &str = ".tokensave";
 
@@ -28,6 +36,52 @@ fn default_docs_dir() -> String {
     crate::docs::DEFAULT_DOCS_DIR.to_string()
 }
 
+/// The set of tools the MCP server lists in `tools/list` (#576).
+///
+/// This selects what the server *lists*, not what it can run: a tool outside
+/// the listed set still answers a `tools/call` by name. Hiding a tool must not
+/// break an agent permission list or a hook that names it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Toolset {
+    /// Every tool. The opt-out from the core default.
+    Full,
+    /// Only the tools in `CORE_TOOLS` (see `mcp::tools`), plus `tokensave_more`
+    /// to list the others on demand. The default.
+    #[default]
+    Core,
+}
+
+impl Toolset {
+    /// Parses a `TOKENSAVE_TOOLS` value. Returns `None` for a value that names
+    /// no toolset, so the caller can keep the configured one.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "core" => Some(Self::Core),
+            _ => None,
+        }
+    }
+
+    /// The toolset to list: `TOKENSAVE_TOOLS` when it names one, otherwise
+    /// `configured`, which is the project's `tools` or, when that is unset,
+    /// the built-in default ([`Toolset::Core`]). Shared by a served project and
+    /// a server with no default project (#606), which has only the built-in
+    /// default to fall back to.
+    pub fn resolve(configured: Self) -> Self {
+        std::env::var("TOKENSAVE_TOOLS")
+            .ok()
+            .and_then(|value| Self::parse(&value))
+            .unwrap_or(configured)
+    }
+}
+
+/// Whether per-call savings are surfaced to the agent (#356):
+/// `TOKENSAVE_REPORT_SAVINGS` when set, otherwise `configured`.
+pub fn resolve_report_savings(configured: bool) -> bool {
+    env_bool_override("TOKENSAVE_REPORT_SAVINGS", configured)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenSaveConfig {
     /// Schema version of the configuration.
@@ -41,6 +95,12 @@ pub struct TokenSaveConfig {
     /// files under `.github/` that would otherwise be skipped.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Glob patterns for paths to index even when a `.gitignore` rule covers
+    /// them (#571). Scoped to the listed globs: nothing else is un-ignored.
+    /// Unlike `include`, this also admits hidden paths the glob names. An
+    /// `exclude` glob still wins, and the size limit still applies.
+    #[serde(default)]
+    pub force_include: Vec<String>,
     /// Maximum file size in bytes; files larger than this are skipped.
     pub max_file_size: u64,
     /// Whether to extract doc comments from source files.
@@ -148,6 +208,18 @@ pub struct TokenSaveConfig {
     /// instead of on every server start.
     #[serde(default)]
     pub suppress_scope_warning: bool,
+    /// Which tools the MCP server lists in `tools/list` (#576). Unset means
+    /// the built-in default, [`Toolset::Core`]; `"full"` lists every tool. The
+    /// `TOKENSAVE_TOOLS` env var overrides this per-run.
+    ///
+    /// A client sends every listed tool schema on every turn, before any tool
+    /// is called, so the full surface is a fixed cost of the context window.
+    /// On a small-context model that cost can be more than half the window.
+    ///
+    /// Unset is not written, so a project that never chose a toolset follows
+    /// the default when it changes. See [`CONFIG_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Toolset>,
 }
 
 /// Serde default for [`TokenSaveConfig::artifact_extensions`].
@@ -157,17 +229,17 @@ pub struct TokenSaveConfig {
 /// every text extension would turn `tokensave_files` into a directory listing.
 fn default_artifact_extensions() -> Vec<String> {
     [
-        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md",
+        "feature", "json", "yaml", "yml", "sql", "toml", "proto", "graphql", "md", "bnd", "bndrun",
     ]
     .iter()
     .map(|ext| (*ext).to_string())
     .collect()
 }
 
-/// Serde default for [`TokenSaveConfig::report_savings`], so configs written
-/// before #356 keep reporting savings rather than silently going quiet.
+/// Serde default for [`TokenSaveConfig::report_savings`]. Off by default so
+/// MCP results stay compact; accounting to the global DB still happens.
 fn default_report_savings() -> bool {
-    true
+    false
 }
 
 /// Serde default for [`TokenSaveConfig::max_auto_sync_files`], so configs
@@ -194,7 +266,7 @@ pub fn env_bool_override(var: &str, config_value: bool) -> bool {
 impl Default for TokenSaveConfig {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: CONFIG_VERSION,
             root_dir: String::new(),
             exclude: vec![
                 // Tool/output/state dirs are matched at any depth (`**/`), so a
@@ -218,6 +290,7 @@ impl Default for TokenSaveConfig {
                 "bin/**".to_string(),
             ],
             include: Vec::new(),
+            force_include: Vec::new(),
             max_file_size: 1_048_576,
             extract_docstrings: true,
             track_call_sites: true,
@@ -233,6 +306,7 @@ impl Default for TokenSaveConfig {
             report_savings: default_report_savings(),
             artifact_extensions: default_artifact_extensions(),
             suppress_scope_warning: false,
+            tools: None,
         }
     }
 }
@@ -269,7 +343,7 @@ pub fn load_config(project_root: &Path) -> Result<TokenSaveConfig> {
         ),
     })?;
 
-    let config: TokenSaveConfig =
+    let mut config: TokenSaveConfig =
         serde_json::from_str(&contents).map_err(|e| TokenSaveError::Config {
             message: format!(
                 "failed to parse config file '{}': {}",
@@ -277,8 +351,22 @@ pub fn load_config(project_root: &Path) -> Result<TokenSaveConfig> {
                 e
             ),
         })?;
+    migrate_config(&mut config);
 
     Ok(config)
+}
+
+/// Brings a config read from disk up to [`CONFIG_VERSION`].
+///
+/// Version 1 (7.13.0) wrote `"tools": "full"` into every config it saved,
+/// because full was its default, so that value says nothing about what the
+/// user wants: it is read as unset, and the next save drops it (#576). A
+/// version 1 `"tools": "core"` was a choice and is kept.
+fn migrate_config(config: &mut TokenSaveConfig) {
+    if config.version < 2 && config.tools == Some(Toolset::Full) {
+        config.tools = None;
+    }
+    config.version = config.version.max(CONFIG_VERSION);
 }
 
 /// Saves the configuration to disk using an atomic write.
@@ -298,7 +386,19 @@ pub fn save_config(project_root: &Path, config: &TokenSaveConfig) -> Result<()> 
     let config_path = get_config_path(project_root);
     let tmp_path = config_path.with_extension("tmp");
 
-    let json = serde_json::to_string_pretty(config).map_err(|e| TokenSaveError::Config {
+    let mut value = serde_json::to_value(config).map_err(|e| TokenSaveError::Config {
+        message: format!("failed to serialize config: {e}"),
+    })?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "_comment".to_string(),
+            serde_json::Value::String(
+                "TOKENSAVE_* environment variables override matching config values when set."
+                    .to_string(),
+            ),
+        );
+    }
+    let json = serde_json::to_string_pretty(&value).map_err(|e| TokenSaveError::Config {
         message: format!("failed to serialize config: {e}"),
     })?;
 
@@ -585,6 +685,29 @@ pub fn resolve_path_with_discovery(path: Option<String>) -> PathBuf {
     }
 }
 
+/// Basename of the dependency lockfile Terraform and `OpenTofu` share.
+///
+/// `OpenTofu` kept Terraform's lockfile name and format, so one basename
+/// covers both tools; the provider registry address inside may be either
+/// `registry.terraform.io/...` or `registry.opentofu.org/...`.
+pub const TERRAFORM_LOCKFILE_BASENAME: &str = ".terraform.lock.hcl";
+
+/// Returns `true` when `path` is a Terraform/OpenTofu dependency lockfile.
+///
+/// The lockfile is the one dot-prefixed, HCL-formatted file a project is
+/// expected to commit and diff, so it is indexed as a path-tracked artifact
+/// even though the scanner's hidden filter and the unsupported `.hcl`
+/// extension would each otherwise drop it. Classification is by exact
+/// basename rather than extension: claiming `hcl` outright would mislabel
+/// every other HCL document (Packer, Consul, Vault, Nomad, Waypoint) as
+/// Terraform source, and an artifact is never parsed, so checksum-heavy
+/// content cannot surface as symbols.
+pub fn is_dependency_lockfile(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == TERRAFORM_LOCKFILE_BASENAME)
+}
+
 /// Returns `true` if the path matches any of the configured `include` patterns.
 ///
 /// This is used to allow hidden (dot-prefixed) directories that would
@@ -605,6 +728,30 @@ pub fn is_included(path: &str, config: &TokenSaveConfig) -> bool {
     }
 
     false
+}
+
+/// Returns `true` if `path` matches a `force_include` glob (#571).
+pub fn is_force_included(path: &str, config: &TokenSaveConfig) -> bool {
+    let match_opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    config.force_include.iter().any(|pattern_str| {
+        Pattern::new(pattern_str).is_ok_and(|pattern| pattern.matches_with(path, match_opts))
+    })
+}
+
+/// The directory a `force_include` walk starts from: the glob's leading
+/// components up to the first one holding a glob metacharacter, so
+/// `some/dir/**` walks only `some/dir` rather than the whole project.
+pub fn force_include_base(pattern: &str) -> String {
+    pattern
+        .split('/')
+        .take_while(|part| !part.contains(['*', '?', '[', '{']))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Returns `true` if a directory should be pruned during scanning.
@@ -790,6 +937,15 @@ mod tests {
     }
 
     #[test]
+    fn force_include_base_stops_at_the_first_glob_component() {
+        assert_eq!(super::force_include_base("some/dir/**"), "some/dir");
+        assert_eq!(super::force_include_base("some/*/gen/**"), "some");
+        assert_eq!(super::force_include_base("docs/api.md"), "docs/api.md");
+        assert_eq!(super::force_include_base("**/generated/**"), "");
+        assert_eq!(super::force_include_base("src/{a,b}/**"), "src");
+    }
+
+    #[test]
     fn test_include_does_not_override_exclude() {
         let config = TokenSaveConfig {
             include: vec![".config/**".to_string()],
@@ -949,19 +1105,19 @@ mod tests {
     }
 
     #[test]
-    fn report_savings_defaults_to_on() {
-        // #356 asked for an opt-out, not a change of default.
-        assert!(TokenSaveConfig::default().report_savings);
+    fn report_savings_defaults_to_off() {
+        // #561: metrics are off by default in MCP results.
+        assert!(!TokenSaveConfig::default().report_savings);
     }
 
     #[test]
-    fn configs_written_before_the_field_existed_keep_reporting() {
-        // Serde must not read a missing field as `false` and silently go quiet
-        // on every project initialized before #356.
+    fn configs_written_before_the_field_existed_default_to_off() {
+        // #561: metrics are off by default, so a config written before the
+        // field existed now defaults to off rather than silently reporting.
         let json = r#"{"version":1,"root_dir":"/x","exclude":[],"max_file_size":1000,
                        "extract_docstrings":true,"track_call_sites":true}"#;
         let config: TokenSaveConfig = serde_json::from_str(json).unwrap();
-        assert!(config.report_savings);
+        assert!(!config.report_savings);
     }
 
     #[test]

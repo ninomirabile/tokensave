@@ -5,6 +5,44 @@ use crate::db::Database;
 use crate::errors::{Result, TokenSaveError};
 use crate::types::*;
 
+/// Godot virtual callbacks that the engine invokes on `Object`, `Node`,
+/// `CanvasItem`, `Control`, `Resource` and the physics bodies. A `.gd`
+/// method with one of these names has no caller in project code (#598).
+const GODOT_ENGINE_VIRTUALS: &[&str] = &[
+    "_init",
+    "_static_init",
+    "_ready",
+    "_enter_tree",
+    "_exit_tree",
+    "_process",
+    "_physics_process",
+    "_input",
+    "_unhandled_input",
+    "_unhandled_key_input",
+    "_shortcut_input",
+    "_gui_input",
+    "_notification",
+    "_draw",
+    "_to_string",
+    "_get",
+    "_set",
+    "_get_property_list",
+    "_validate_property",
+    "_property_can_revert",
+    "_property_get_revert",
+    "_get_configuration_warnings",
+    "_integrate_forces",
+    "_has_point",
+    "_get_minimum_size",
+    "_make_custom_tooltip",
+    "_get_drag_data",
+    "_can_drop_data",
+    "_drop_data",
+    "_structured_text_parser",
+    "_setup_local_to_scene",
+    "_run",
+];
+
 /// Metrics describing the connectivity and structure around a single node.
 #[derive(Debug, Clone)]
 pub struct NodeMetrics {
@@ -257,6 +295,11 @@ impl<'a> GraphQueryManager<'a> {
         let marker_ids = self.db.collect_test_marker_ids().await?;
         self.db.populate_test_marker_temp_table(&marker_ids).await?;
         self.db.populate_test_annotated_targets_temp_table().await?;
+        let godot_virtuals = GODOT_ENGINE_VIRTUALS
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let sql = format!(
             "SELECT id, kind, name, qualified_name, file_path, start_line, end_line,
@@ -273,6 +316,10 @@ impl<'a> GraphQueryManager<'a> {
              -- Rust trait-impl methods are exempt. Scoped to `.go` so a callable
              -- function named `init` in another language is still checked (#346).
              AND NOT (name = 'init' AND file_path LIKE '%.go')
+             -- Godot engine virtuals (`_ready`, `_process`, ...) are called by the
+             -- engine, never by project code, so they have no incoming edge either.
+             -- Scoped to `.gd` for the same reason as Go `init` (#598).
+             AND NOT (file_path LIKE '%.gd' AND name IN ({godot_virtuals}))
              {visibility_filter}
              {kind_filter}
              {trait_impl_filter}
@@ -302,7 +349,69 @@ impl<'a> GraphQueryManager<'a> {
             let node = row_to_node_dead_code(&row)?;
             dead.push(node);
         }
+
+        if dead
+            .iter()
+            .any(|n| crate::resolution::is_gdscript(&n.file_path))
+        {
+            // Best effort: a failed lookup leaves the overrides reported, and
+            // must not fail the whole dead-code query.
+            let live = self.gdscript_live_overrides().await.unwrap_or_default();
+            if !live.is_empty() {
+                dead.retain(|n| !live.contains(&n.id));
+            }
+        }
         Ok(dead)
+    }
+
+    /// `GDScript` methods that override a base-class method which is called or
+    /// used (#598).
+    ///
+    /// A base class calling `_fields()` on `self` resolves to the base
+    /// declaration, yet for a subclass instance it is the override that runs.
+    /// The override has no edge of its own, and adding a synthetic one would
+    /// make `callers`/`callees` claim a call the source does not make, so the
+    /// override is exempted here instead. Inheritance comes from resolved
+    /// `extends` edges, followed transitively, so a grandchild override of a
+    /// called method is live too; an override of a base method nothing
+    /// reaches stays dead, like the base method itself.
+    async fn gdscript_live_overrides(&self) -> Result<HashSet<String>> {
+        let sql = "WITH RECURSIVE ancestry(cls, base) AS (
+                 SELECT e.source, e.target FROM edges e
+                 WHERE e.kind = 'extends'
+                   AND e.source IN (SELECT id FROM nodes
+                                    WHERE file_path LIKE '%.gd'
+                                      AND kind IN ('class', 'inner_class'))
+                 UNION
+                 SELECT a.cls, e.target FROM ancestry a
+                 JOIN edges e ON e.source = a.base AND e.kind = 'extends'
+             )
+             SELECT DISTINCT m.id FROM ancestry a
+             JOIN nodes m ON m.parent_id = a.cls AND m.kind IN ('function', 'method')
+             JOIN nodes b ON b.parent_id = a.base AND b.name = m.name
+                         AND b.kind IN ('function', 'method')
+             WHERE EXISTS (SELECT 1 FROM edges c
+                           WHERE c.target = b.id AND c.kind IN ('calls', 'uses'))";
+        let mut rows =
+            self.db
+                .conn()
+                .query(sql, ())
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to find live GDScript overrides: {e}"),
+                    operation: "gdscript_live_overrides".to_string(),
+                })?;
+        let mut live = HashSet::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read row: {e}"),
+            operation: "gdscript_live_overrides".to_string(),
+        })? {
+            live.insert(row.get::<String>(0).map_err(|e| TokenSaveError::Database {
+                message: format!("failed to read override id: {e}"),
+                operation: "gdscript_live_overrides".to_string(),
+            })?);
+        }
+        Ok(live)
     }
 
     /// Computes metrics for a single node describing its graph connectivity.

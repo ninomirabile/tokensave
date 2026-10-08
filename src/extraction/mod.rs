@@ -36,6 +36,8 @@ mod powershell_extractor;
 mod proto_extractor;
 #[cfg(feature = "lang-ruby")]
 mod ruby_extractor;
+#[cfg(feature = "lang-ruby")]
+mod ruby_template_extractor;
 #[cfg(feature = "lang-vbnet")]
 mod vbnet_extractor;
 
@@ -50,6 +52,8 @@ mod canvas_extractor;
 mod clojure_extractor;
 #[cfg(feature = "lang-cobol")]
 mod cobol_extractor;
+#[cfg(feature = "lang-css")]
+mod css_extractor;
 #[cfg(feature = "lang-cuda")]
 mod cuda_extractor;
 #[cfg(feature = "lang-dockerfile")]
@@ -74,6 +78,8 @@ mod gwbasic_extractor;
 mod haskell_extractor;
 #[cfg(feature = "lang-hlsl")]
 mod hlsl_extractor;
+#[cfg(feature = "lang-html")]
+mod html_extractor;
 #[cfg(feature = "lang-julia")]
 mod julia_extractor;
 #[cfg(feature = "lang-lean")]
@@ -106,8 +112,12 @@ mod r_extractor;
 mod sql_extractor;
 #[cfg(feature = "lang-systemverilog")]
 mod systemverilog_extractor;
+#[cfg(feature = "lang-terraform")]
+mod terraform_extractor;
 #[cfg(feature = "lang-toml")]
 mod toml_extractor;
+#[cfg(feature = "lang-vhdl")]
+mod vhdl_extractor;
 #[cfg(feature = "lang-wgsl")]
 mod wgsl_extractor;
 #[cfg(feature = "lang-xaml")]
@@ -147,6 +157,8 @@ pub use powershell_extractor::PowerShellExtractor;
 pub use proto_extractor::ProtoExtractor;
 #[cfg(feature = "lang-ruby")]
 pub use ruby_extractor::RubyExtractor;
+#[cfg(feature = "lang-ruby")]
+pub use ruby_template_extractor::RubyTemplateExtractor;
 #[cfg(feature = "lang-vbnet")]
 pub use vbnet_extractor::VbNetExtractor;
 
@@ -161,6 +173,8 @@ pub use canvas_extractor::CanvasExtractor;
 pub use clojure_extractor::ClojureExtractor;
 #[cfg(feature = "lang-cobol")]
 pub use cobol_extractor::CobolExtractor;
+#[cfg(feature = "lang-css")]
+pub use css_extractor::CssExtractor;
 #[cfg(feature = "lang-cuda")]
 pub use cuda_extractor::CudaExtractor;
 #[cfg(feature = "lang-dockerfile")]
@@ -185,6 +199,8 @@ pub use gwbasic_extractor::GwBasicExtractor;
 pub use haskell_extractor::HaskellExtractor;
 #[cfg(feature = "lang-hlsl")]
 pub use hlsl_extractor::HlslExtractor;
+#[cfg(feature = "lang-html")]
+pub use html_extractor::HtmlExtractor;
 #[cfg(feature = "lang-julia")]
 pub use julia_extractor::JuliaExtractor;
 #[cfg(feature = "lang-lean")]
@@ -217,8 +233,12 @@ pub use r_extractor::RExtractor;
 pub use sql_extractor::SqlExtractor;
 #[cfg(feature = "lang-systemverilog")]
 pub use systemverilog_extractor::SystemVerilogExtractor;
+#[cfg(feature = "lang-terraform")]
+pub use terraform_extractor::TerraformExtractor;
 #[cfg(feature = "lang-toml")]
 pub use toml_extractor::TomlExtractor;
+#[cfg(feature = "lang-vhdl")]
+pub use vhdl_extractor::VhdlExtractor;
 #[cfg(feature = "lang-wgsl")]
 pub use wgsl_extractor::WgslExtractor;
 #[cfg(feature = "lang-xaml")]
@@ -333,6 +353,8 @@ impl LanguageRegistry {
         extractors.push(Box::new(HlslExtractor));
         #[cfg(feature = "lang-systemverilog")]
         extractors.push(Box::new(SystemVerilogExtractor));
+        #[cfg(feature = "lang-vhdl")]
+        extractors.push(Box::new(VhdlExtractor));
         #[cfg(feature = "lang-cuda")]
         extractors.push(Box::new(CudaExtractor));
         #[cfg(feature = "lang-metal")]
@@ -365,6 +387,12 @@ impl LanguageRegistry {
         extractors.push(Box::new(LeanExtractor));
         #[cfg(feature = "lang-toml")]
         extractors.push(Box::new(TomlExtractor));
+        #[cfg(feature = "lang-terraform")]
+        extractors.push(Box::new(TerraformExtractor));
+        #[cfg(feature = "lang-html")]
+        extractors.push(Box::new(HtmlExtractor));
+        #[cfg(feature = "lang-css")]
+        extractors.push(Box::new(CssExtractor));
         #[cfg(feature = "lang-gdscript")]
         extractors.push(Box::new(GdScriptExtractor));
         #[cfg(feature = "lang-mcfunction")]
@@ -692,6 +720,7 @@ int api_call(int x);
     }
 
     #[test]
+    #[cfg(feature = "lang-objc")]
     fn objc_header_routes_to_objc() {
         let source = r"
 @interface Widget : NSObject

@@ -80,9 +80,15 @@ fn extract_text(value: &Value) -> &str {
 /// Searches for `name` via the search handler and returns the first matching
 /// node id whose name field equals `name`.
 async fn find_node_id(cg: &TokenSave, name: &str) -> String {
-    let result = handle_tool_call(cg, "tokensave_search", json!({"query": name}), None, None)
-        .await
-        .unwrap();
+    let result = handle_tool_call(
+        cg,
+        "tokensave_search",
+        json!({"query": name, "format": "json", "ids": true}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let text = extract_text(&result.value);
     let items: Vec<Value> = serde_json::from_str(text).unwrap();
     items
@@ -119,6 +125,36 @@ async fn test_search() {
 }
 
 #[tokio::test]
+async fn test_search_ids_opt_in() {
+    let (_dir, cg) = setup_project().await;
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_search",
+        json!({"query": "helper", "ids": true, "format": "json"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert!(parsed[0]["id"].is_string());
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_search",
+        json!({"query": "helper", "format": "json"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert!(parsed[0]["id"].is_null());
+}
+
+#[tokio::test]
 async fn test_search_literal_finds_string_in_body() {
     let (_dir, cg) = setup_project().await;
     // `Hello, {}!` is a string literal inside `format_greeting`'s body — it is
@@ -127,7 +163,7 @@ async fn test_search_literal_finds_string_in_body() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "Hello, {}!", "literal": true}),
+        json!({"query": "Hello, {}!", "literal": true, "format": "json"}),
         None,
         None,
     )
@@ -168,7 +204,7 @@ async fn test_search_literal_respects_queryignore() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "Hello, {}!", "literal": true}),
+        json!({"query": "Hello, {}!", "literal": true, "format": "json"}),
         None,
         None,
     )
@@ -188,7 +224,7 @@ async fn test_search_literal_no_match_returns_empty() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "this string does not exist anywhere zzz", "literal": true}),
+        json!({"query": "this string does not exist anywhere zzz", "literal": true, "format": "json"}),
         None,
         None,
     )
@@ -207,7 +243,7 @@ async fn test_search_literal_respects_limit() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "helper", "literal": true, "limit": 1}),
+        json!({"query": "helper", "literal": true, "limit": 1, "format": "json"}),
         None,
         None,
     )
@@ -232,6 +268,7 @@ async fn test_search_literal_respects_path_include() {
             "literal": true,
             "path_include": ["src/utils.rs"],
             "limit": 20,
+            "format": "json",
         }),
         None,
         None,
@@ -265,6 +302,7 @@ async fn test_search_literal_respects_path_exclude() {
             "literal": true,
             "path_exclude": ["tests/"],
             "limit": 20,
+            "format": "json",
         }),
         None,
         None,
@@ -290,7 +328,7 @@ async fn test_search_literal_case_sensitive() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "hello, {}!", "literal": true}),
+        json!({"query": "hello, {}!", "literal": true, "format": "json"}),
         None,
         None,
     )
@@ -302,6 +340,40 @@ async fn test_search_literal_case_sensitive() {
         parsed["matches"].as_array().unwrap().is_empty(),
         "literal search must be case-sensitive"
     );
+}
+
+#[tokio::test]
+async fn test_read_text_format_returns_raw_source() {
+    let (_dir, cg) = setup_project().await;
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_read",
+        json!({ "file": "src/main.rs", "format": "text" }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    assert!(text.contains("fn main()"), "{text}");
+    assert!(text.contains("file: src/main.rs"), "{text}");
+}
+
+#[tokio::test]
+async fn test_literal_search_text_format() {
+    let (_dir, cg) = setup_project().await;
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_search",
+        json!({ "query": "helper", "literal": true, "format": "text" }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    assert!(text.contains("src/main.rs:"), "{text}");
+    assert!(text.contains("src/utils.rs:"), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +438,12 @@ async fn test_callers_nonexistent_node_id_errors() {
     assert!(
         msg.contains("node not found"),
         "expected a node-not-found error, got: {msg}"
+    );
+    // #576: tokensave_callers_for is not a core tool, so the error says how
+    // to list it.
+    assert!(
+        msg.contains("tokensave_callers_for (via tokensave_more area \"navigate\""),
+        "{msg}"
     );
 }
 
@@ -604,6 +682,28 @@ async fn test_files_flat_format() {
     assert!(text.contains("bytes"), "flat format should show byte sizes");
 }
 
+/// A valid filter that matches nothing used to hand `truncate_response` an
+/// empty string, tripping a `debug_assert` that took the whole server down in
+/// a debug build while a release build returned an empty text block (#499).
+#[tokio::test]
+async fn test_files_flat_format_with_no_matches() {
+    let (_dir, cg) = setup_project().await;
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_files",
+        json!({"pattern": "**/*ROADMAP*.md", "kind": "artifact", "format": "flat"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    assert_eq!(
+        text, "0 indexed files",
+        "an empty flat listing should say so rather than return an empty body"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 13. tokensave_affected
 // ---------------------------------------------------------------------------
@@ -772,12 +872,21 @@ async fn test_rename_preview() {
     )
     .await
     .unwrap();
+    // A hidden alias of `tokensave_rename` with dry_run forced on (#568).
     let text = extract_text(&result.value);
-    assert!(
-        text.contains("reference_count"),
-        "should have reference_count key"
-    );
-    assert!(text.contains("node"), "should have node key");
+    let plan: Value = serde_json::from_str(text).expect("rename plan is JSON");
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["symbol"]["name"], "helper");
+    assert!(plan["counts"]["exact"].as_u64().unwrap() >= 1, "{plan:#}");
+    // The definition and the call from main.rs are both rename sites.
+    let files: Vec<&str> = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap())
+        .collect();
+    assert!(files.contains(&"src/utils.rs"), "{plan:#}");
+    assert!(files.contains(&"src/main.rs"), "{plan:#}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1406,7 @@ async fn test_search_populates_touched_files() {
 }
 
 // ---------------------------------------------------------------------------
-// Extra: rename_preview with nonexistent node
+// Extra: rename_preview (alias of tokensave_rename) with nonexistent node
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1743,7 +1852,7 @@ async fn test_search_scope_prefix_filters() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "helper", "limit": 20}),
+        json!({"query": "helper", "limit": 20, "format": "json"}),
         None,
         Some("tests"),
     )
@@ -1867,13 +1976,48 @@ async fn test_str_replace_success() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
-    assert_eq!(parsed["matched_str"], "fn hello() {}");
-    assert_eq!(parsed["new_str"], "fn hello_updated() {}");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([1, 1]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
+    assert!(parsed["matched_str"].is_null());
+    assert!(parsed["new_str"].is_null());
 
     let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(content.contains("fn hello_updated() {}"));
     assert!(!content.contains("fn hello() {}"));
+}
+
+#[tokio::test]
+async fn test_str_replace_echo_returns_text() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+
+    fs::write(project.join("src/main.rs"), "fn hello() {}\n").unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_str_replace",
+        json!({
+            "path": "src/main.rs",
+            "old_str": "fn hello() {}",
+            "new_str": "fn hello_updated() {}",
+            "echo": true
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["matched_str"], "fn hello() {}");
+    assert_eq!(parsed["new_str"], "fn hello_updated() {}");
 }
 
 #[tokio::test]
@@ -1903,7 +2047,7 @@ async fn test_str_replace_not_found() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], false);
+    assert_eq!(parsed["ok"], false);
     assert!(parsed["message"].as_str().unwrap().contains("not found"));
 }
 
@@ -1934,7 +2078,7 @@ async fn test_str_replace_multiple_matches_fails() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], false);
+    assert_eq!(parsed["ok"], false);
     assert!(parsed["message"]
         .as_str()
         .unwrap()
@@ -2091,7 +2235,8 @@ async fn test_str_replace_unsupported_file_type_succeeds() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(project.join("style.css")).unwrap();
     assert!(content.contains("0.85rem"));
@@ -2325,7 +2470,9 @@ async fn test_insert_at_string_anchor_before() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([2, 2]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(
@@ -2371,8 +2518,9 @@ async fn test_insert_at_line_number() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
-    assert_eq!(parsed["anchor_line"], 2);
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([3, 3]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(
@@ -2414,7 +2562,7 @@ async fn test_insert_at_anchor_not_found() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], false);
+    assert_eq!(parsed["ok"], false);
     assert!(parsed["message"].as_str().unwrap().contains("not found"));
 }
 
@@ -2448,7 +2596,7 @@ async fn test_insert_at_unicode_anchor_prefix_does_not_panic() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], false);
+    assert_eq!(parsed["ok"], false);
     assert!(parsed["message"].as_str().unwrap().contains("not found"));
 
     let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -2487,7 +2635,7 @@ async fn test_insert_at_ambiguous_anchor() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], false);
+    assert_eq!(parsed["ok"], false);
     assert!(parsed["message"]
         .as_str()
         .unwrap()
@@ -2524,7 +2672,8 @@ async fn test_insert_at_preserves_trailing_newline() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(project.join("src/lib.rs")).unwrap();
     assert!(
@@ -2533,6 +2682,198 @@ async fn test_insert_at_preserves_trailing_newline() {
         &content[content.len().saturating_sub(20)..]
     );
     assert_eq!(content, "fn hello() {}\n\nfn extra() {}\nfn world() {}\n");
+}
+
+#[tokio::test]
+async fn test_delete_symbol_removes_doc_and_function() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        "/// docs\nfn hello() {}\nfn world() {}\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_delete_symbol",
+        json!({ "symbol": "hello" }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([1, 2]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
+
+    let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!content.contains("hello"));
+    assert!(!content.contains("docs"));
+    assert!(content.contains("fn world() {}"));
+}
+
+#[tokio::test]
+async fn test_replace_lines_success() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        "fn a() {}\nfn b() {}\nfn c() {}\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_replace_lines",
+        json!({
+            "path": "src/main.rs",
+            "start": 2,
+            "end": 2,
+            "new_content": "fn b2() {}"
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([2, 2]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
+
+    let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(content.contains("fn b2() {}"));
+    assert!(!content.contains("fn b() {}"));
+}
+
+#[tokio::test]
+async fn test_replace_lines_stale_digest_fails() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/main.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_replace_lines",
+        json!({
+            "path": "src/main.rs",
+            "start": 1,
+            "end": 1,
+            "new_content": "fn x() {}",
+            "expected_digest": "stale"
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], false);
+    assert!(parsed["message"]
+        .as_str()
+        .unwrap()
+        .contains("digest mismatch"));
+}
+
+#[tokio::test]
+async fn test_replace_lines_delete_empty() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        "fn a() {}\nfn b() {}\nfn c() {}\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_replace_lines",
+        json!({
+            "path": "src/main.rs",
+            "start": 2,
+            "end": 2,
+            "new_content": ""
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([2, 2]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
+
+    let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!content.contains("fn b() {}"));
+    assert_eq!(content, "fn a() {}\nfn c() {}\n");
+}
+
+#[tokio::test]
+async fn test_replace_lines_delete_whole_file_leaves_empty() {
+    // Regression #564: deleting the entire file with `new_content: ""` must
+    // leave an empty file, not a single stray newline.
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/main.rs"),
+        "fn a() {}\nfn b() {}\nfn c() {}\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_replace_lines",
+        json!({
+            "path": "src/main.rs",
+            "start": 1,
+            "end": 3,
+            "new_content": ""
+        }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["lines"], json!([1, 3]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
+
+    let content = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert_eq!(content, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -2814,6 +3155,7 @@ async fn test_dependency_depth() {
 /// Builds a project holding one real function plus a comment-only shell
 /// script of `filler_lines` lines, and returns the `equality` dimension of
 /// `tokensave_health`.
+#[cfg(feature = "lang-bash")]
 async fn equality_with_filler(filler_lines: usize) -> f64 {
     let dir = TempDir::new().unwrap();
     let project = dir.path();
@@ -2849,6 +3191,7 @@ async fn equality_with_filler(filler_lines: usize) -> f64 {
 /// extracted symbols therefore scored its own length as complexity, so the
 /// `equality` dimension moved when a comment-only file got longer.
 #[tokio::test]
+#[cfg(feature = "lang-bash")]
 async fn test_health_equality_ignores_a_symbol_free_files_length() {
     let short = equality_with_filler(20).await;
     let long = equality_with_filler(400).await;
@@ -3009,6 +3352,62 @@ pub fn unrelated(x: i32) -> i32 {
     .unwrap();
     let parsed2: serde_json::Value = serde_json::from_str(extract_text(&result2.value)).unwrap();
     assert_eq!(parsed2["pair_count"], parsed["pair_count"]);
+}
+
+/// Issue #599: GDScript functions had no fingerprint language, so every one
+/// was reported as `skipped_for_size` and no GDScript pair was ever found.
+#[cfg(feature = "lang-gdscript")]
+#[tokio::test]
+async fn test_redundancy_scans_gdscript() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::write(
+        project.join("twins.gd"),
+        "class_name Twins\nextends RefCounted\n\n\n\
+func first(values: Array[int]) -> int:\n\
+\tvar total := 0\n\
+\tfor value: int in values:\n\
+\t\tif value > 0:\n\
+\t\t\ttotal += value * 2\n\
+\t\telse:\n\
+\t\t\ttotal -= value\n\
+\treturn total\n\n\n\
+func second(values: Array[int]) -> int:\n\
+\tvar total := 0\n\
+\tfor value: int in values:\n\
+\t\tif value > 0:\n\
+\t\t\ttotal += value * 2\n\
+\t\telse:\n\
+\t\t\ttotal -= value\n\
+\treturn total\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+    let result = handle_tool_call(
+        &cg,
+        "tokensave_redundancy",
+        json!({ "min_lines": 1, "similarity_threshold": 0.5 }),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&result.value);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    assert!(parsed["scanned"].as_u64().unwrap_or(0) >= 2, "{text}");
+    assert_eq!(parsed["skipped_unsupported_language"], 0, "{text}");
+    let pairs = parsed["pairs"].as_array().expect("pairs array");
+    let found = pairs.iter().any(|p| {
+        let names = [
+            p["a"]["name"].as_str().unwrap_or(""),
+            p["b"]["name"].as_str().unwrap_or(""),
+        ];
+        names.contains(&"first") && names.contains(&"second")
+    });
+    assert!(found, "expected first/second pair: {text}");
 }
 
 /// Issue #80: `tokensave_runtime` must surface process + DB telemetry so
@@ -3604,7 +4003,7 @@ async fn test_body_returns_full_function_source() {
     let result = handle_tool_call(
         &cg,
         "tokensave_body",
-        json!({"symbol": "format_greeting"}),
+        json!({"symbol": "format_greeting", "format": "json"}),
         None,
         None,
     )
@@ -4086,7 +4485,7 @@ async fn body_prefers_function_over_field_with_same_name() {
     let result = handle_tool_call(
         &cg,
         "tokensave_body",
-        json!({"symbol": "gmres"}),
+        json!({"symbol": "gmres", "format": "json"}),
         None,
         None,
     )
@@ -5449,7 +5848,7 @@ pub mod e;
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "LinearOperator", "limit": 10}),
+        json!({"query": "LinearOperator", "limit": 10, "format": "json"}),
         None,
         None,
     )
@@ -5478,6 +5877,7 @@ pub mod e;
 ///    this path — every candidate shares the 0.3×, so the exact-named
 ///    heading keeps its bonus-driven lead over partial heading matches.
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn search_doc_penalty_on_additive_query_path() {
     let dir = TempDir::new().unwrap();
     let project = dir.path();
@@ -5505,7 +5905,7 @@ async fn search_doc_penalty_on_additive_query_path() {
     let result = handle_tool_call(
         &cg,
         "tokensave_search",
-        json!({"query": "Configuration", "limit": 10}),
+        json!({"query": "Configuration", "limit": 10, "format": "json"}),
         None,
         None,
     )
@@ -5606,8 +6006,17 @@ async fn mcp_server_owns_watcher_and_refreshes_token_map_on_change() {
     // growing is the observable outcome regardless of which sync won.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let after_count = loop {
-        let stale = server.cg().find_stale_files().await;
-        server.cg().sync_if_stale_silent(&stale).await.unwrap();
+        let stale = server
+            .cg()
+            .expect("default project")
+            .find_stale_files()
+            .await;
+        server
+            .cg()
+            .expect("default project")
+            .sync_if_stale_silent(&stale)
+            .await
+            .unwrap();
         server.refresh_file_token_map().await;
         let count = server.file_token_map_snapshot().len();
         if count > initial_count || std::time::Instant::now() >= deadline {
@@ -5828,6 +6237,7 @@ pub fn residual_vector<T: LinearOperator>(operator: &T, x: &[f64], ax: &mut [f64
             target: sources[0].id.clone(),
             kind: tokensave::types::EdgeKind::Calls,
             line: Some(14),
+            resolved_by: None,
         }])
         .await
         .unwrap();
@@ -5976,36 +6386,42 @@ async fn affected_classifies_candidates_and_includes_inline_sources_in_suite() {
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: direct,
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: facade.clone(),
                 target: changed.clone(),
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: integration,
                 target: facade,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(3),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: bridge.clone(),
                 target: changed,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
             tokensave::types::Edge {
                 source: consumer,
                 target: bridge,
                 kind: tokensave::types::EdgeKind::Calls,
                 line: Some(1),
+                resolved_by: None,
             },
         ])
         .await
@@ -6092,13 +6508,10 @@ async fn test_str_replace_resolved_path_for_relative_path_in_root() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true);
-    // Unchanged backward-compatible behavior: file_path stays project-relative.
-    assert_eq!(parsed["file_path"], "src/main.rs");
-    // New: resolved_path is always the fully-resolved absolute path actually
-    // read/written, so a caller can verify the edit landed where intended.
-    let expected_resolved = project.join("src/main.rs").to_string_lossy().to_string();
-    assert_eq!(parsed["resolved_path"], expected_resolved);
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["file"], "src/main.rs");
+    assert_eq!(parsed["lines"], json!([1, 1]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 }
 
 #[tokio::test]
@@ -6135,11 +6548,13 @@ async fn test_str_replace_absolute_path_outside_root_honored_verbatim() {
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(
-        parsed["success"], true,
+        parsed["ok"], true,
         "absolute path outside the indexed root must be honored, not rejected: {text}"
     );
     let expected = outside_file.to_string_lossy().to_string();
-    assert_eq!(parsed["resolved_path"], expected);
+    assert_eq!(parsed["file"], expected);
+    assert_eq!(parsed["lines"], json!([1, 1]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(&outside_file).unwrap();
     assert_eq!(content, "done: fixed the bug\n");
@@ -6191,12 +6606,10 @@ async fn test_str_replace_project_root_override_writes_to_worktree_not_primary_c
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true, "got: {text}");
-    let expected_resolved = worktree_root
-        .join("src/main.rs")
-        .to_string_lossy()
-        .to_string();
-    assert_eq!(parsed["resolved_path"], expected_resolved);
+    assert_eq!(parsed["ok"], true, "got: {text}");
+    assert_eq!(parsed["file"], "src/main.rs");
+    assert_eq!(parsed["lines"], json!([1, 1]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     // The worktree copy was edited...
     let worktree_content = fs::read_to_string(worktree_root.join("src/main.rs")).unwrap();
@@ -6239,9 +6652,11 @@ async fn test_insert_at_absolute_path_outside_root_honored_verbatim() {
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true, "got: {text}");
+    assert_eq!(parsed["ok"], true, "got: {text}");
     let expected = outside_file.to_string_lossy().to_string();
-    assert_eq!(parsed["resolved_path"], expected);
+    assert_eq!(parsed["file"], expected);
+    assert_eq!(parsed["lines"], json!([2, 2]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let content = fs::read_to_string(&outside_file).unwrap();
     assert_eq!(content, "line one\ninserted line\nline two\n");
@@ -6285,12 +6700,9 @@ async fn test_replace_symbol_project_root_override_writes_to_worktree_not_primar
 
     let text = extract_text(&result.value);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed["success"], true, "got: {text}");
-    let expected_resolved = worktree_root
-        .join("src/lib.rs")
-        .to_string_lossy()
-        .to_string();
-    assert_eq!(parsed["resolved_path"], expected_resolved);
+    assert_eq!(parsed["ok"], true, "got: {text}");
+    assert_eq!(parsed["lines"], json!([1, 3]));
+    assert!(parsed["digest"].as_str().unwrap().len() == 64);
 
     let worktree_content = fs::read_to_string(worktree_root.join("src/lib.rs")).unwrap();
     assert!(worktree_content.contains("hi from worktree"));
@@ -6445,6 +6857,7 @@ async fn setup_documented_project() -> (TempDir, TokenSave) {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn doc_tool_returns_sidecar_documentation() {
     let (_dir, cg) = setup_documented_project().await;
     let result = handle_tool_call(
@@ -6477,6 +6890,7 @@ async fn doc_tool_returns_sidecar_documentation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn doc_tool_returns_docs_dir_doc_for_every_covered_file() {
     let (_dir, cg) = setup_documented_project().await;
     for file in ["src/search_es8.rs", "src/feed_es8.rs"] {
@@ -6515,6 +6929,7 @@ async fn doc_tool_reports_no_doc_for_undocumented_file() {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn doc_tool_can_omit_content() {
     let (_dir, cg) = setup_documented_project().await;
     let result = handle_tool_call(
@@ -6534,6 +6949,7 @@ async fn doc_tool_can_omit_content() {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn doc_tool_normalizes_backslash_paths() {
     let (_dir, cg) = setup_documented_project().await;
     let result = handle_tool_call(
@@ -6580,6 +6996,7 @@ async fn doc_tool_is_registered_in_the_tool_list() {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn entities_marks_files_that_have_companion_docs() {
     let (_dir, cg) = setup_documented_project().await;
     let result = handle_tool_call(
@@ -6594,7 +7011,12 @@ async fn entities_marks_files_that_have_companion_docs() {
     let parsed: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
     assert_eq!(parsed["has_doc"], true, "{parsed:?}");
     assert_eq!(parsed["doc_path"], json!(["src/big_class.readme.md"]));
-    assert!(parsed["doc_hint"].is_string(), "{parsed:?}");
+    // #576: tokensave_doc is not a core tool, so the hint says how to list it.
+    let hint = parsed["doc_hint"].as_str().expect("doc_hint");
+    assert!(
+        hint.contains("tokensave_doc") && hint.contains("tokensave_more area \"navigate\""),
+        "{hint}"
+    );
 }
 
 #[tokio::test]
@@ -6616,6 +7038,7 @@ async fn entities_marks_undocumented_files_without_a_doc_path() {
 }
 
 #[tokio::test]
+#[cfg(feature = "lang-markdown")]
 async fn doc_staleness_flags_code_committed_after_the_doc() {
     // Drift detection is the one part that needs real git history: a doc is
     // stale when its covered code was committed *after* it.

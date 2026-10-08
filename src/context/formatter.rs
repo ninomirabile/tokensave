@@ -43,7 +43,9 @@ fn fence_language(file_path: &str) -> &'static str {
         "go" => "go",
         "java" => "java",
         "kt" | "kts" => "kotlin",
-        "rb" => "ruby",
+        "rb" | "rake" => "ruby",
+        "erb" => "erb",
+        "slim" => "slim",
         "php" => "php",
         "cs" => "csharp",
         "c" | "h" => "c",
@@ -557,6 +559,7 @@ mod tests {
         assert_eq!(super::fence_language("a/b.tsx"), "tsx");
         assert_eq!(super::fence_language("a/b.ts"), "typescript");
         assert_eq!(super::fence_language("a/b.rs"), "rust");
+        assert_eq!(super::fence_language("lib/tasks/sample.rake"), "ruby");
         assert_eq!(super::fence_language("a/b.unknownext"), "");
     }
 

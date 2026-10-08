@@ -22,20 +22,6 @@ pub struct NodeFilter {
     name_contains: Option<String>,
 }
 
-/// Escapes a string for use inside a `LIKE` pattern.
-///
-/// Without this, a path containing `_` or `%` acts as a wildcard: a filter for
-/// the directory `a_b` would also match `axb`. That is a wrong-results bug
-/// rather than an error, so it fails silently — which is why the escaping is
-/// paired with a test rather than left to review. `\` is the escape character,
-/// declared with `ESCAPE` at each use site.
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 impl NodeFilter {
     /// An unconstrained filter, equivalent to selecting every node.
     #[must_use]
@@ -93,12 +79,8 @@ impl NodeFilter {
         let mut clauses: Vec<String> = Vec::new();
 
         if let Some(prefix) = &self.path_prefix {
-            let exact = prefix.trim_end_matches('/');
-            let mut sql = String::from("(file_path = ");
-            push_quoted(&mut sql, exact);
-            sql.push_str(" OR file_path LIKE ");
-            push_quoted(&mut sql, &format!("{}/%", escape_like(exact)));
-            sql.push_str(" ESCAPE '\\')");
+            let mut sql = String::new();
+            push_path_prefix_filter(&mut sql, "", prefix);
             clauses.push(sql);
         }
 
@@ -340,7 +322,7 @@ impl Database {
 
         // Edges (Contains has already been hoisted out into parent_id)
         for chunk in surviving_edges.chunks(500) {
-            sql.push_str("INSERT OR IGNORE INTO edges (source,target,kind,line) VALUES ");
+            sql.push_str("INSERT INTO edges (source,target,kind,line,resolved_by) VALUES ");
             for (i, edge) in chunk.iter().enumerate() {
                 if i > 0 {
                     sql.push(',');
@@ -356,8 +338,14 @@ impl Database {
                     Some(l) => push_int(&mut sql, i64::from(l)),
                     None => sql.push_str("NULL"),
                 }
+                sql.push(',');
+                match edge.resolved_by {
+                    Some(r) => push_int(&mut sql, r.code()),
+                    None => sql.push_str("NULL"),
+                }
                 sql.push(')');
             }
+            sql.push_str(EDGE_UPSERT_CLAUSE);
             sql.push_str(";\n");
         }
 
@@ -865,6 +853,7 @@ impl Database {
                 reference_name: get_string_lossy(&row, 1).unwrap_or_default(),
                 file_path: get_string_lossy(&row, 2).unwrap_or_default(),
                 line: row.get::<i64>(3).unwrap_or(0) as u32,
+                column: 0,
                 candidate_node_ids: serde_json::from_str(&encoded).unwrap_or_default(),
             });
         }
@@ -894,6 +883,55 @@ impl Database {
             let encoded = get_string_lossy(&row, 0).unwrap_or_default();
             let ids: Vec<String> = serde_json::from_str(&encoded).unwrap_or_default();
             out.extend(ids);
+        }
+        Ok(out)
+    }
+
+    /// Recorded ambiguous calls that name `node_id` among their candidates.
+    ///
+    /// `candidate_node_ids` is a JSON array, so the `LIKE` is a cheap
+    /// prefilter on the quoted id and the decoded array is checked exactly.
+    pub async fn get_ambiguous_calls_naming(&self, node_id: &str) -> Result<Vec<AmbiguousCall>> {
+        let pattern = format!(
+            "%\"{}\"%",
+            node_id
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let mut rows = self
+            .conn()
+            .query(
+                "SELECT from_node_id, reference_name, file_path, line, candidate_node_ids
+                 FROM ambiguous_calls
+                 WHERE candidate_node_ids LIKE ?1 ESCAPE '\\'
+                 ORDER BY file_path, line",
+                params![pattern],
+            )
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to query ambiguous calls for a candidate: {e}"),
+                operation: "get_ambiguous_calls_naming".to_string(),
+            })?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| TokenSaveError::Database {
+            message: format!("failed to read ambiguous call row: {e}"),
+            operation: "get_ambiguous_calls_naming".to_string(),
+        })? {
+            let encoded = get_string_lossy(&row, 4).unwrap_or_default();
+            let candidate_node_ids: Vec<String> =
+                serde_json::from_str(&encoded).unwrap_or_default();
+            if !candidate_node_ids.iter().any(|id| id == node_id) {
+                continue;
+            }
+            out.push(AmbiguousCall {
+                from_node_id: get_string_lossy(&row, 0).unwrap_or_default(),
+                reference_name: get_string_lossy(&row, 1).unwrap_or_default(),
+                file_path: get_string_lossy(&row, 2).unwrap_or_default(),
+                line: row.get::<i64>(3).unwrap_or(0) as u32,
+                column: 0,
+                candidate_node_ids,
+            });
         }
         Ok(out)
     }
@@ -992,13 +1030,29 @@ impl Database {
     /// actually needed — `tests/resolution_slim_nodes_test.rs` asserts the two
     /// loads resolve identically, so a future resolver change that starts
     /// reading either field fails loudly instead of silently seeing `None`.
+    ///
+    /// One exception: `GDScript` classes, functions and fields keep their
+    /// signature. The resolver reads a receiver's static type through them —
+    /// the `extends` base of a class, the `-> Type` of a method, the `: Type` of
+    /// a field (#597). The extractor stores one declaration line there (a
+    /// function's up to its body), so the column is bounded for these rows.
+    /// C# type declarations, methods, fields and properties keep theirs for
+    /// the same reason (#642): base lists, return types and member types.
     pub async fn get_all_nodes_for_resolution(&self) -> Result<Vec<Node>> {
         let mut rows = self
             .conn()
             .query(
                 "SELECT id, kind, name, qualified_name, file_path,
                     start_line, end_line, start_column, end_column,
-                    NULL AS docstring, NULL AS signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
+                    NULL AS docstring,
+                    CASE WHEN file_path LIKE '%.gd'
+                              AND kind IN ('class', 'inner_class', 'function', 'method', 'field')
+                         THEN signature
+                         WHEN file_path LIKE '%.cs'
+                              AND kind IN ('class', 'inner_class', 'struct', 'interface', 'record',
+                                           'function', 'method', 'field', 'csharp_property')
+                         THEN signature END AS signature,
+                    visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
                  FROM nodes",
                 (),
             )
@@ -1055,6 +1109,12 @@ impl Database {
             !file_path.starts_with('/'),
             "delete_nodes_by_file expects relative path, got absolute"
         );
+        // Serialize the whole delete against other write transactions on the
+        // shared connection: a concurrent edit reindex or background sync can
+        // otherwise open a second transaction while this one is active, which
+        // SQLite rejects as "cannot start a transaction within a transaction"
+        // (#563).
+        let _write_guard = self.write_lock.lock().await;
         self.conn()
             .execute(
                 "DELETE FROM executable_body_fts WHERE file_path = ?1",

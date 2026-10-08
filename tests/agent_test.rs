@@ -3,8 +3,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use tokensave::agents::*;
 
-mod common;
-use common::{make_install_ctx, make_install_ctx_with_real_bin};
+use crate::common::{make_install_ctx, make_install_ctx_with_real_bin};
 
 // ---------------------------------------------------------------------------
 // 1. Registry tests
@@ -1986,6 +1985,21 @@ fn test_read_only_tool_names_excludes_mutating_tools() {
             "mutating tool should not be read-only: {mutating}"
         );
     }
+}
+
+/// The core toolset is the default (#576), so the first call that lists more
+/// tools is `tokensave_more`. It must be granted at install time like every
+/// other tool, or that first call prompts.
+#[test]
+fn test_install_time_tool_lists_include_tokensave_more() {
+    let more = tokensave::mcp::tools::MORE_TOOL;
+    assert!(tool_names().contains(&more.to_string()));
+    assert!(read_only_tool_names().contains(&more.to_string()));
+    assert!(expected_tool_perms().contains(&format!("mcp__tokensave__{more}")));
+    assert_eq!(
+        tool_names().len(),
+        tokensave::mcp::tools::get_tool_definitions().len() + 1
+    );
 }
 
 #[test]

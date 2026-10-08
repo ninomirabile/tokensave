@@ -7,11 +7,32 @@ Thanks for your interest in contributing! This guide covers everything you need 
 ```bash
 git clone https://github.com/aovestdipaperino/tokensave.git
 cd tokensave
-cargo build
-cargo test
+cargo build --locked
+cargo test --workspace --locked
 ```
 
-Requires **Rust 1.70+** (edition 2021).
+Requires **Rust 1.95.0+** (edition 2021). The CI and release toolchain is pinned to **1.98.1**.
+
+## Build and Artifact Lifecycle
+
+Standard Cargo commands define the supported workflow:
+
+```bash
+cargo build --locked                     # debug development build
+cargo test --workspace --locked          # locked workspace tests
+cargo build --release --locked           # optimized release build
+cargo install --path . --locked          # optimized locked install into ~/.cargo/bin
+```
+
+Development commands use the debug profile; installation uses only the
+optimized release output. `target/debug` is never an installation input.
+
+`.cargo/config.toml` sets `TOKENSAVE_SKIP_AGENT_MAINTENANCE=1` for every cargo
+process, which keeps the test suite from touching your own agent configuration
+(#575). Tests spawn the freshly built binary, whose version is ahead of
+whatever you last installed, and that is the signal the silent agent resync
+watches for. Unset it only if you are deliberately exercising that path, and
+not against your real home directory.
 
 ## Project Structure
 
@@ -38,14 +59,14 @@ tokensave supports more than 50 languages via feature flags (see the README for 
 | Feature | Languages |
 |---------|-----------|
 | `lite` (default subset) | Rust, Go, Java, Scala, TypeScript/JS, Python, C, C++, Kotlin, C#, Swift, Svelte, Astro |
-| `medium` | +Dart, Pascal, PHP, Ruby, Bash, Protobuf, PowerShell, Nix, VB.NET |
+| `medium` | +Dart, Pascal, PHP, Ruby (including ERB and Slim templates), Bash, Protobuf, PowerShell, Nix, VB.NET |
 | `full` (default) | +ActionScript, Lua, Zig, Obj-C, Perl, Batch, Fortran, COBOL, the BASIC family, Dockerfile, shader languages (GLSL/WGSL/HLSL/Metal), CUDA/HIP, Markdown, R, SQL, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, F#, F*, Quint, TOML, Lean |
 
 Build with fewer languages for faster compile times during development:
 
 ```bash
-cargo build --no-default-features --features lite
-cargo test --no-default-features --features lite
+cargo build --locked --no-default-features --features lite
+cargo test --locked --no-default-features --features lite
 ```
 
 ## Making Changes
@@ -54,12 +75,12 @@ cargo test --no-default-features --features lite
 2. **Write tests.** Every extraction change should have a corresponding test in `tests/`. Follow the existing pattern: create a fixture in `tests/fixtures/` and assert on extracted nodes/edges.
 3. **Run the full test suite** before submitting:
    ```bash
-   cargo test
+   cargo test --workspace --locked
    ```
 4. **Format your code** with the standard Rust toolchain:
    ```bash
-   cargo fmt
-   cargo clippy
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --locked
    ```
 
 ## Adding a New Language Extractor
@@ -67,21 +88,31 @@ cargo test --no-default-features --features lite
 1. Add a tree-sitter grammar dependency (or vendor it under `vendor/`).
 2. Create `src/extraction/{lang}_extractor.rs` implementing the `Extractor` trait.
 3. Register it in the `LanguageRegistry` with a feature flag (e.g., `lang-{name}`).
-4. Add a fixture file `tests/fixtures/sample.{ext}` and a test file `tests/{lang}_extraction_test.rs`.
+4. Add a fixture file `tests/fixtures/sample.{ext}` and a test file `tests/{lang}_extraction_test.rs`, then declare it as `mod {lang}_extraction_test;` in `tests/integration.rs` (test files are not auto-discovered; see [Test layout](#test-layout)).
 5. Update the feature flag tables in `Cargo.toml` and this document.
 
 ## Running Specific Tests
 
 ```bash
-# All tests for a specific language
-cargo test --test rust_extraction_test
+# All tests for a specific language (a module of the shared integration binary)
+cargo test --locked --test integration rust_extraction_test::
 
 # A single test by name
-cargo test test_find_stale_files
+cargo test --locked test_find_stale_files
 
 # Only sync-related tests
-cargo test sync
+cargo test --locked sync
+
+# Faster local loop: only the 11 lite-tier languages (language tests for the
+# other tiers are compiled out). CI still runs the full feature set.
+cargo test-lite
 ```
+
+### Test layout
+
+All `tests/*.rs` files are modules of one test binary, `tests/integration.rs`, because every test binary statically links all tree-sitter grammars and SQLite: 180 separate binaries took hundreds of gigabytes of `target/`. `Cargo.toml` sets `autotests = false`, so a new test file must be declared as a `mod` in `tests/integration.rs`, and helpers are shared through `crate::common`.
+
+Tests in the shared binary run concurrently with every other test file, so a test must not mutate process-global state: environment variables (`std::env::set_var`), the current directory, or the `tokensave::cancel` flag. Such a file gets its own `[[test]]` target in `Cargo.toml` instead, next to the existing isolated ones. A test that re-runs its own binary with `--exact` must pass the module-qualified name from `common::qualified_test_name(module_path!(), "...")`.
 
 ## Environment Variables
 

@@ -32,23 +32,39 @@ fn io_err(msg: &str) -> impl Fn(std::io::Error) -> TokenSaveError + '_ {
     }
 }
 
-/// Fetches the `browser_download_url` for a specific asset in a GitHub release.
-fn fetch_asset_url(tag: &str, expected_asset: &str) -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
+/// The name of the release asset listing each other asset's SHA256.
+///
+/// Published by both release workflows in `sha256sum` format, one line per
+/// asset.
+const SUMS_ASSET: &str = "SHA256SUMS";
+
+/// One asset attached to a GitHub release.
+#[derive(serde::Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// A located release asset, together with the SHA256 the release publishes
+/// for it.
+struct VerifiedAsset {
+    url: String,
+    sha256: String,
+}
+
+/// Fetches every asset attached to a release.
+///
+/// One request serves both the binary lookup and the `SHA256SUMS` lookup —
+/// they come from the same release, so asking twice would only add a way for
+/// the two to disagree.
+fn fetch_release_assets(tag: &str) -> Result<Vec<Asset>> {
     #[derive(serde::Deserialize)]
     struct Release {
         assets: Vec<Asset>,
     }
 
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}");
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .into();
+    let agent = cloud::agent_with_timeout(std::time::Duration::from_secs(30));
 
     let release: Release = agent
         .get(&url)
@@ -63,33 +79,164 @@ fn fetch_asset_url(tag: &str, expected_asset: &str) -> Result<String> {
             message: format!("failed to parse release info: {e}"),
         })?;
 
-    release
-        .assets
-        .into_iter()
+    Ok(release.assets)
+}
+
+/// Downloads a small text asset (the sums file) in full.
+fn fetch_text_asset(url: &str) -> Result<String> {
+    let agent = cloud::agent_with_timeout(std::time::Duration::from_secs(30));
+    agent
+        .get(url)
+        .header("User-Agent", "tokensave")
+        .call()
+        .map_err(|e| TokenSaveError::Config {
+            message: format!("failed to download {SUMS_ASSET}: {e}"),
+        })?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| TokenSaveError::Config {
+            message: format!("failed to read {SUMS_ASSET}: {e}"),
+        })
+}
+
+/// Pulls one asset's hash out of a `sha256sum`-format listing.
+///
+/// Accepts both the text (`hash  name`) and binary (`hash *name`) markers
+/// `sha256sum` emits, and ignores blank lines so a trailing newline is not an
+/// error. Returns `None` when the file is well-formed but does not mention
+/// `asset`, which the caller reports separately from a malformed file.
+fn sha256_for_asset(listing: &str, asset: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (hash, name) = line.split_once(char::is_whitespace)?;
+        let name = name.trim_start_matches(['*', ' ']).trim();
+        (name == asset && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+/// Locates the platform's release asset and the SHA256 published for it.
+///
+/// Fails closed (#525). A release whose `SHA256SUMS` is missing, unreadable,
+/// or silent about this asset aborts the upgrade rather than installing an
+/// unverified binary: `upgrade` only ever moves forward to a channel's latest,
+/// so every release a verifying binary can reach is one published after the
+/// sums file started shipping. Treating "no sums" as "skip verification" would
+/// hand anyone who can suppress the file a silent downgrade to no integrity
+/// check at all, which is the property being bought here.
+fn locate_verified_asset(tag: &str, expected_asset: &str) -> Result<VerifiedAsset> {
+    let assets = fetch_release_assets(tag)?;
+
+    let url = assets
+        .iter()
         .find(|a| a.name == expected_asset)
-        .map(|a| a.browser_download_url)
+        .map(|a| a.browser_download_url.clone())
         .ok_or_else(|| TokenSaveError::Config {
             message: format!(
                 "release {tag} exists but asset '{expected_asset}' is not yet available.\n  \
                  CI build may still be in progress — try again in a few minutes.\n  \
                  https://github.com/{GITHUB_REPO}/releases/tag/{tag}",
             ),
+        })?;
+
+    let sums_url = assets
+        .iter()
+        .find(|a| a.name == SUMS_ASSET)
+        .map(|a| a.browser_download_url.clone())
+        .ok_or_else(|| TokenSaveError::Update {
+            message: format!(
+                "release {tag} publishes no {SUMS_ASSET}, so the download cannot be \
+                 verified — refusing to install.\n  \
+                 If CI is still finishing, try again in a few minutes:\n  \
+                 https://github.com/{GITHUB_REPO}/releases/tag/{tag}",
+            ),
+        })?;
+
+    let listing = fetch_text_asset(&sums_url)?;
+    let sha256 =
+        sha256_for_asset(&listing, expected_asset).ok_or_else(|| TokenSaveError::Update {
+            message: format!(
+                "release {tag} publishes {SUMS_ASSET} but it lists no hash for \
+                 '{expected_asset}' — refusing to install.\n  \
+                 https://github.com/{GITHUB_REPO}/releases/tag/{tag}",
+            ),
+        })?;
+
+    Ok(VerifiedAsset { url, sha256 })
+}
+
+/// Hex-encodes the SHA256 of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{byte:02x}");
+            acc
         })
 }
 
+/// A downloaded binary staged for installation, and the private directory
+/// holding it.
+///
+/// The directory is owned by this value so it is removed when the staged
+/// binary goes out of scope, whether the replacement succeeded or not.
+struct StagedBinary {
+    /// Held for its `Drop`, which removes the directory and anything left in
+    /// it. Never read directly — [`Self::path`] is the accessor.
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl StagedBinary {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Creates the private directory the downloaded binary is extracted into.
+///
+/// The destination used to be `std::env::temp_dir().join("tokensave_upgrade_<pid>")`
+/// — a name another local user can predict and pre-create. Both extraction
+/// paths open it with `create`-like semantics that follow symlinks, so on a
+/// host with a shared world-writable `/tmp` a symlink planted at that path
+/// would be followed and the target written with this process's privileges
+/// (#525). `TempDir` picks a random name and creates it exclusively, failing
+/// rather than adopting a path that already exists, which is what defeats the
+/// planted symlink; the extraction code is then unchanged and simply writes
+/// somewhere nobody else can name. The mode is narrowed to `0700` afterwards
+/// because `tempdir()` creates with `0777 & !umask` — commonly `0755`, which
+/// would leave the staged binary readable by every other local user between
+/// extraction and install.
+fn new_staging_dir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("tokensave_upgrade_")
+        .tempdir()
+        .map_err(io_err("create temp dir failed"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(io_err("secure temp dir failed"))?;
+    }
+
+    Ok(dir)
+}
+
 /// Downloads the archive from `url` into memory, then extracts `bin_name`
-/// to a temp path. Returns the temp path.
-fn download_and_extract(url: &str, bin_name: &str) -> Result<std::path::PathBuf> {
-    let tmp_path = std::env::temp_dir().join(format!(
-        "tokensave_upgrade_{}{}",
-        std::process::id(),
+/// into a freshly created private directory. Returns the staged binary.
+fn download_and_extract(url: &str, bin_name: &str, expected_sha256: &str) -> Result<StagedBinary> {
+    let tmp_dir = new_staging_dir()?;
+    let tmp_path = tmp_dir.path().join(format!(
+        "tokensave{}",
         if cfg!(windows) { ".exe" } else { "" }
     ));
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_mins(5)))
-        .build()
-        .into();
+    let agent = cloud::agent_with_timeout(std::time::Duration::from_mins(5));
 
     eprint!("  Downloading...");
 
@@ -113,6 +260,26 @@ fn download_and_extract(url: &str, bin_name: &str) -> Result<std::path::PathBuf>
     };
 
     eprintln!(" ({:.1} MiB)", raw.len() as f64 / 1_048_576.0);
+
+    // Verified before extraction, not after (#525): extraction writes the
+    // archive's contents to disk, so a mismatched archive must never reach it.
+    eprint!("  Verifying...");
+    let actual = sha256_hex(&raw);
+    if actual != expected_sha256 {
+        eprintln!(" \x1b[31mFAILED\x1b[0m");
+        return Err(TokenSaveError::Update {
+            message: format!(
+                "downloaded archive does not match the SHA256 published for it — \
+                 refusing to install.\n  \
+                 expected: {expected_sha256}\n  \
+                 actual:   {actual}\n  \
+                 This means the download was corrupted or tampered with. \
+                 Nothing has been installed."
+            ),
+        });
+    }
+    eprintln!(" OK");
+
     eprint!("  Extracting...");
 
     #[cfg(not(windows))]
@@ -122,7 +289,10 @@ fn download_and_extract(url: &str, bin_name: &str) -> Result<std::path::PathBuf>
     extract_zip(&raw, bin_name, &tmp_path)?;
 
     eprintln!(" Done");
-    Ok(tmp_path)
+    Ok(StagedBinary {
+        _dir: tmp_dir,
+        path: tmp_path,
+    })
 }
 
 /// Extracts `bin_name` from a `.tar.gz` archive (Unix).
@@ -480,11 +650,14 @@ fn replace_for_scoop(new_exe: &Path, _new_version: &str) -> Result<()> {
 /// Verifies the release asset exists on GitHub and returns the download URL.
 /// Call this early so we fail fast when CI hasn't finished building the
 /// release yet.
-fn preflight_asset_check(version: &str, is_beta: bool) -> Result<String> {
+fn preflight_asset_check(version: &str, is_beta: bool) -> Result<VerifiedAsset> {
     let tag = release_tag(version);
     let expected = asset_name(version, is_beta);
     eprintln!("  Asset: {expected}");
-    fetch_asset_url(&tag, &expected)
+    // Resolving the hash here rather than mid-download keeps the fail-fast
+    // property the asset check already had: a release missing its sums fails
+    // before the archive is fetched, not after ~150 MiB of it.
+    locate_verified_asset(&tag, &expected)
 }
 
 /// Record the *currently running* binary's version in user config just before
@@ -507,14 +680,14 @@ fn record_previous_version() {
     }
 }
 
-fn perform_upgrade(version: &str, asset_url: &str, method: &InstallMethod) -> Result<()> {
+fn perform_upgrade(version: &str, asset: &VerifiedAsset, method: &InstallMethod) -> Result<()> {
     let bin_name = if cfg!(windows) {
         "tokensave.exe"
     } else {
         "tokensave"
     };
 
-    let tmp = download_and_extract(asset_url, bin_name)?;
+    let staged = download_and_extract(&asset.url, bin_name, &asset.sha256)?;
 
     let label = match method {
         InstallMethod::Brew => " (Homebrew Cellar)",
@@ -522,7 +695,7 @@ fn perform_upgrade(version: &str, asset_url: &str, method: &InstallMethod) -> Re
         _ => "",
     };
     eprint!("  Replacing binary{label}...");
-    replace_binary(&tmp, method, version)?;
+    replace_binary(staged.path(), method, version)?;
     eprintln!(" Done");
 
     Ok(())
@@ -837,8 +1010,16 @@ pub fn run_upgrade(kill: bool) -> Result<String> {
 
     eprintln!("Checking for updates...");
 
-    let latest = cloud::fetch_latest_version().ok_or_else(|| TokenSaveError::Config {
-        message: "failed to check for updates — could not reach GitHub".to_string(),
+    // Name the condition that actually holds. A release with no asset for this
+    // platform used to be reported as an unreachable network, sending people to
+    // debug a working connection (#513).
+    let latest = cloud::try_fetch_latest_version().map_err(|e| TokenSaveError::Update {
+        message: match e {
+            cloud::VersionCheckError::Unreachable { .. } => {
+                format!("failed to check for updates — {e}")
+            }
+            _ => format!("{e}. Staying on v{current}"),
+        },
     })?;
 
     let latest = match classify_upgrade(current, &latest) {
@@ -853,9 +1034,9 @@ pub fn run_upgrade(kill: bool) -> Result<String> {
 
     handle_running_processes(kill)?;
 
-    let asset_url = preflight_asset_check(latest, is_beta)?;
+    let asset = preflight_asset_check(latest, is_beta)?;
 
-    perform_upgrade(latest, &asset_url, &method)?;
+    perform_upgrade(latest, &asset, &method)?;
     record_previous_version();
     eprintln!("\x1b[32m✔\x1b[0m Successfully upgraded to v{latest}!");
     Ok(latest.to_string())
@@ -894,19 +1075,19 @@ pub fn switch_channel(target_channel: &str) -> Result<String> {
     eprintln!("Switching from {current_channel} to {target_channel}...");
 
     let latest = if target_is_beta {
-        cloud::fetch_latest_beta_version()
+        cloud::try_fetch_latest_beta_version()
     } else {
-        cloud::fetch_latest_stable_version()
+        cloud::try_fetch_latest_stable_version()
     }
-    .ok_or_else(|| TokenSaveError::Config {
-        message: format!("failed to find latest {target_channel} release — could not reach GitHub"),
+    .map_err(|e| TokenSaveError::Update {
+        message: format!("cannot switch to the {target_channel} channel — {e}"),
     })?;
 
     eprintln!("  Target: v{latest}");
 
-    let asset_url = preflight_asset_check(&latest, target_is_beta)?;
+    let asset = preflight_asset_check(&latest, target_is_beta)?;
 
-    perform_upgrade(&latest, &asset_url, &method)?;
+    perform_upgrade(&latest, &asset, &method)?;
     record_previous_version();
     eprintln!("\x1b[32m✔\x1b[0m Switched to {target_channel} channel: v{latest}");
     Ok(latest)
@@ -922,6 +1103,163 @@ pub fn switch_channel(target_channel: &str) -> Result<String> {
 )]
 mod tests {
     use super::*;
+
+    /// The staging directory must not be at a name another local user can
+    /// predict. The old path was `temp_dir()/tokensave_upgrade_<pid>`, and a
+    /// pid is both guessable and observable, so a symlink planted there ahead
+    /// of the download would have been followed on extraction (#525).
+    #[test]
+    fn the_staging_directory_is_not_a_predictable_path() {
+        let a = new_staging_dir().expect("staging dir");
+        let b = new_staging_dir().expect("staging dir");
+
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two staging directories in the same process must not collide"
+        );
+
+        let legacy = std::env::temp_dir().join(format!("tokensave_upgrade_{}", std::process::id()));
+        assert_ne!(a.path(), legacy, "must not reuse the old pid-derived name");
+    }
+
+    /// `TempDir` must create the directory rather than adopt one that is
+    /// already there — adopting is what makes a planted path dangerous.
+    #[test]
+    fn the_staging_directory_is_freshly_created() {
+        let dir = new_staging_dir().expect("staging dir");
+        assert!(dir.path().is_dir(), "the directory must exist");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read staging dir")
+                .next()
+                .is_none(),
+            "a freshly created staging directory must be empty"
+        );
+    }
+
+    /// On Unix the directory must not be readable or writable by other users,
+    /// so nothing can race the extracted binary between write and install.
+    /// `tempdir()` alone creates with `0777 & !umask` — commonly `0755`, which
+    /// leaves the staged binary readable by every other local user while it
+    /// sits there. The narrowing is therefore explicit, and asserted.
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_directory_is_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = new_staging_dir().expect("staging dir");
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat staging dir")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(
+            mode, 0o700,
+            "staging directory should be user-only, got {mode:o}"
+        );
+    }
+
+    /// The staged binary sits inside that directory, so its full path inherits
+    /// the directory's unpredictability even though the file name is fixed.
+    #[test]
+    fn the_staged_binary_lives_inside_the_private_directory() {
+        let dir = new_staging_dir().expect("staging dir");
+        let staged = dir.path().join(format!(
+            "tokensave{}",
+            if cfg!(windows) { ".exe" } else { "" }
+        ));
+
+        assert!(
+            staged.starts_with(dir.path()),
+            "the staged binary must be contained by the private directory"
+        );
+    }
+
+    // ── SHA256 verification (#525) ───────────────────────────────────────
+
+    #[test]
+    fn sha256_hex_matches_a_known_vector() {
+        // The empty-input digest, so this pins the encoding rather than
+        // restating whatever the implementation happens to produce.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_sums_listing_yields_the_hash_for_the_named_asset() {
+        let listing = "\
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tokensave-v1.2.3-x86_64-linux.tar.gz
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  tokensave-v1.2.3-aarch64-macos.tar.gz
+";
+        assert_eq!(
+            sha256_for_asset(listing, "tokensave-v1.2.3-aarch64-macos.tar.gz").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[test]
+    fn a_sums_listing_accepts_the_binary_mode_marker() {
+        // `sha256sum -b` and the Windows leg emit `hash *name`.
+        let listing =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *tokensave-v1.2.3-x86_64-windows.zip\n";
+        assert_eq!(
+            sha256_for_asset(listing, "tokensave-v1.2.3-x86_64-windows.zip").as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+    }
+
+    #[test]
+    fn an_asset_absent_from_the_listing_has_no_hash() {
+        // The caller turns this into a refusal, not a skipped check — a
+        // release that does not name our asset must not install (#525).
+        let listing =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  some-other-asset.tar.gz\n";
+        assert!(sha256_for_asset(listing, "tokensave-v1.2.3-x86_64-linux.tar.gz").is_none());
+    }
+
+    #[test]
+    fn a_malformed_or_truncated_hash_is_not_accepted() {
+        // A short, over-long, or non-hex field must not be treated as a hash:
+        // it would compare unequal to every real digest and turn a verifiable
+        // release into an unexplained mismatch.
+        for bad in [
+            "deadbeef  tokensave-v1.2.3-x86_64-linux.tar.gz",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  tokensave-v1.2.3-x86_64-linux.tar.gz",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855aa  tokensave-v1.2.3-x86_64-linux.tar.gz",
+        ] {
+            assert!(
+                sha256_for_asset(bad, "tokensave-v1.2.3-x86_64-linux.tar.gz").is_none(),
+                "{bad} should not parse as a hash"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_blank_listing_has_no_hash() {
+        for listing in ["", "\n", "   \n\n"] {
+            assert!(sha256_for_asset(listing, "tokensave-v1.2.3-x86_64-linux.tar.gz").is_none());
+        }
+    }
+
+    #[test]
+    fn a_hash_is_compared_case_insensitively() {
+        // Some tools emit uppercase hex; normalising on parse keeps that from
+        // reading as tampering.
+        let listing =
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  tokensave-v1.2.3-x86_64-linux.tar.gz\n";
+        assert_eq!(
+            sha256_for_asset(listing, "tokensave-v1.2.3-x86_64-linux.tar.gz").as_deref(),
+            Some(sha256_hex(b"").as_str())
+        );
+    }
 
     #[test]
     fn test_asset_name_stable() {

@@ -3,6 +3,7 @@
 //! Checks the binary, project index, global DB, user config, agent
 //! integrations, and network connectivity.
 
+use crate::agents::hooks as tokensave_hooks;
 use std::path::{Path, PathBuf};
 
 use crate::agents::{self, DoctorCounters, HealthcheckContext};
@@ -32,6 +33,7 @@ pub async fn run_doctor(agent_filter: Option<&str>) {
             project_path.display()
         ));
         check_database(&mut dc, &project_path).await;
+        check_hook_freshness(&mut dc, &project_path);
     } else {
         dc.warn(&format!(
             "No index at {}/.tokensave/ — run `tokensave init`",
@@ -279,10 +281,17 @@ fn check_network(dc: &mut DoctorCounters) {
     } else {
         dc.warn("Worldwide counter unreachable (offline or timeout)");
     }
-    if crate::cloud::fetch_latest_version().is_some() {
-        dc.pass("GitHub releases API reachable");
-    } else {
-        dc.warn("GitHub releases API unreachable (offline or timeout)");
+    // Reachability and installability are separate findings: a release with no
+    // asset for this platform means GitHub answered fine (#513).
+    match crate::cloud::try_fetch_latest_version() {
+        Ok(_) => dc.pass("GitHub releases API reachable"),
+        Err(crate::cloud::VersionCheckError::Unreachable { detail }) => {
+            dc.warn(&format!("GitHub releases API unreachable ({detail})"));
+        }
+        Err(e) => {
+            dc.pass("GitHub releases API reachable");
+            dc.warn(&format!("No installable release for this platform: {e}"));
+        }
     }
 }
 
@@ -301,6 +310,44 @@ fn print_summary(dc: &DoctorCounters) {
         eprintln!("Run \x1b[1mtokensave install\x1b[0m to fix most issues.");
     }
     eprintln!();
+}
+
+/// Reports a git hook whose tokensave section is out of date (#342 Q1, #624).
+///
+/// Read-only: the rewrite happens on install/reinstall, not here. Surfacing it
+/// is what keeps an automatic edit to a file in the user's repository from
+/// being entirely silent — they can see that it is pending and what will fix
+/// it.
+fn check_hook_freshness(dc: &mut DoctorCounters, project_path: &std::path::Path) {
+    let bin = std::env::current_exe()
+        .map_or_else(|_| "tokensave".to_string(), |p| p.display().to_string());
+
+    let stale = tokensave_hooks::stale_hook_blocks(project_path, &bin);
+    if stale.is_empty() {
+        return;
+    }
+    let local_dir = tokensave_hooks::repo_hooks_dir(project_path);
+    for path in stale {
+        let local_hook = local_dir
+            .as_deref()
+            .is_some_and(|dir| path.parent() == Some(dir));
+        let repair = if local_hook {
+            format!(
+                "run `tokensave githooks on --local --path {}` to update it",
+                project_path.display()
+            )
+        } else {
+            "run `tokensave reinstall` to update it".to_string()
+        };
+        let hook = path
+            .file_name()
+            .map_or_else(|| "hook".into(), |n| n.to_string_lossy());
+        dc.warn(&format!(
+            "git {hook} hook at {} carries an outdated tokensave section — \
+             {repair} (content outside tokensave's markers is preserved)",
+            path.display()
+        ));
+    }
 }
 
 #[cfg(test)]

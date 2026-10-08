@@ -4,6 +4,39 @@ use super::*;
 
 const RUBY_SINGLETON_KIND_METADATA: &str = "ruby_singleton_method_kind_v1";
 
+/// Ruby source whose every change rebuilds the reopening table. ERB and
+/// Slim templates are Ruby too, but they almost never declare a class or
+/// module, so they go through `template_changes_reopenings` instead of
+/// rebuilding the whole table on every view save.
+fn is_ruby_source(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rb") || ext.eq_ignore_ascii_case("rake"))
+}
+
+fn is_ruby_template(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("erb") || ext.eq_ignore_ascii_case("slim"))
+}
+
+fn declares_ruby_namespace<'a>(mut kinds: impl Iterator<Item = &'a NodeKind>) -> bool {
+    kinds.any(|kind| matches!(kind, NodeKind::Class | NodeKind::Module))
+}
+
+/// Whether re-indexing or removing a template can change the Ruby reopening
+/// table: only when it declared a class or module before the change (`old`,
+/// read before its rows are deleted) or declares one after it (`new`).
+fn template_changes_reopenings(
+    path: &str,
+    old: &[crate::resolution::TouchedNode],
+    new: &[Node],
+) -> bool {
+    is_ruby_template(path)
+        && (declares_ruby_namespace(old.iter().map(|n| &n.kind))
+            || declares_ruby_namespace(new.iter().map(|n| &n.kind)))
+}
+
 fn legacy_ruby_repair_complete(
     repair_required: bool,
     scheduled: &[String],
@@ -473,13 +506,23 @@ impl TokenSave {
 
         // 6. Sort by PK order + dedup edges
         all_nodes.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        // Provenance last, so the duplicate `dedup_by` keeps is the one with
+        // the strongest `resolved_by` (#544).
         all_edges.sort_unstable_by(|a, b| {
-            (&a.source, &a.target, a.kind.as_str(), &a.line).cmp(&(
-                &b.source,
-                &b.target,
-                b.kind.as_str(),
-                &b.line,
-            ))
+            (
+                &a.source,
+                &a.target,
+                a.kind.as_str(),
+                &a.line,
+                a.provenance_key(),
+            )
+                .cmp(&(
+                    &b.source,
+                    &b.target,
+                    b.kind.as_str(),
+                    &b.line,
+                    b.provenance_key(),
+                ))
         });
         all_edges.dedup_by(|a, b| {
             a.source == b.source && a.target == b.target && a.kind == b.kind && a.line == b.line
@@ -520,6 +563,7 @@ impl TokenSave {
 
         // 8. Restore indexes and normal durability
         self.db.end_bulk_load().await?;
+        self.db.rebuild_ruby_reopenings().await?;
         self.db.rebuild_trait_dispatch_callers().await?;
         on_verbose(&format!(
             "wrote to database in {:.1}s",
@@ -530,6 +574,9 @@ impl TokenSave {
         let now_str = current_timestamp().to_string();
         self.db.set_metadata("last_full_sync_at", &now_str).await?;
         self.db.set_metadata("last_sync_at", &now_str).await?;
+        self.db
+            .set_metadata("last_full_index_version", env!("CARGO_PKG_VERSION"))
+            .await?;
         self.touch_branch_synced();
         self.db
             .set_metadata("last_sync_duration_ms", &duration_ms.to_string())
@@ -664,11 +711,19 @@ impl TokenSave {
     /// records, against 189,446 inputs. The Go selector suppression runs once
     /// over the accumulated set, since nothing guarantees a selector and its
     /// bare-name sibling land in the same page.
+    ///
+    /// `incremental` narrows the pass to the references `touched` says this
+    /// sync could have changed; without it every reference is re-attempted.
     async fn resolve_all_streamed(
         &self,
         resolver: &ReferenceResolver<'_>,
-        touched: Option<&TouchedSet>,
+        touched: &TouchedSet,
+        incremental: bool,
     ) -> Result<StreamedResolution> {
+        let stale_sites = self
+            .clear_stale_gdscript_sites(touched, incremental)
+            .await?;
+        let touched = incremental.then_some(touched);
         let mut cursor = 0i64;
         let mut resolved: Vec<ResolvedRef> = Vec::new();
         let mut ambiguous: Vec<AmbiguousCall> = Vec::new();
@@ -692,7 +747,17 @@ impl TokenSave {
             // already in the table and their ambiguity records already written,
             // so re-deriving them produces byte-identical rows at full cost.
             if let Some(touched) = touched {
-                refs.retain(|uref| touched.needs_resolve(&uref.file_path, &uref.reference_name));
+                refs.retain(|uref| {
+                    touched.needs_resolve(&uref.file_path, &uref.reference_name)
+                        || (!stale_sites.is_empty()
+                            && uref.reference_kind == EdgeKind::Calls
+                            && stale_sites.contains(&(
+                                uref.from_node_id.clone(),
+                                uref.line,
+                                crate::resolution::simple_ref_name(&uref.reference_name)
+                                    .to_string(),
+                            )))
+                });
             }
             if refs.is_empty() {
                 continue;
@@ -710,6 +775,7 @@ impl TokenSave {
             ambiguous.extend(batch_ambiguous);
         }
 
+        resolver.finalize_ambiguous(&resolved, &mut ambiguous);
         resolver.finalize_resolved(&mut resolved);
         Ok(StreamedResolution {
             resolved,
@@ -718,6 +784,47 @@ impl TokenSave {
             attempted,
             attempted_refs,
         })
+    }
+
+    /// Clears the `calls` edges of `GDScript` typed-receiver call sites whose
+    /// answer this sync may have changed while their file stayed put, and
+    /// returns those sites (#597).
+    ///
+    /// A typed edge depends on declarations in other files: a member's
+    /// `: Type`, a method's `-> Type`, a class's `extends`. When one changes,
+    /// the touched set re-attempts the typed ref, but its caller's file was
+    /// not re-extracted, so the edge it wrote last time is still in the table
+    /// and would survive a re-attempt that no longer finds it. Edges carry no
+    /// column, so a site is (caller, line, bare callee name): every edge such
+    /// a site could have produced is deleted here, and the caller re-attempts
+    /// every reference at the site — the typed ref, its receiver-qualified
+    /// sibling, and any other same-named call on that line — so the table
+    /// ends up exactly as a full index would leave it.
+    ///
+    /// A file this sync re-extracted is skipped: re-extraction already
+    /// dropped its edges along with its nodes.
+    async fn clear_stale_gdscript_sites(
+        &self,
+        touched: &TouchedSet,
+        incremental: bool,
+    ) -> Result<HashSet<(String, u32, String)>> {
+        let sites: HashSet<(String, u32, String)> = self
+            .db
+            .get_gdscript_typed_refs()
+            .await?
+            .into_iter()
+            .filter(|uref| !touched.files().contains(&uref.file_path))
+            .filter(|uref| {
+                !incremental || touched.needs_resolve(&uref.file_path, &uref.reference_name)
+            })
+            .map(|uref| {
+                let name = crate::resolution::simple_ref_name(&uref.reference_name).to_string();
+                (uref.from_node_id, uref.line, name)
+            })
+            .collect();
+        let list: Vec<(String, u32, String)> = sites.iter().cloned().collect();
+        self.db.delete_call_edges_at_sites(&list).await?;
+        Ok(sites)
     }
 
     /// Writes the ambiguity records at the granularity this pass earns
@@ -841,6 +948,7 @@ impl TokenSave {
         // in case a future internal caller skips the wrappers. The DB's
         // canonical form is forward-slash (#87).
         let file_paths = normalize_rel_paths(file_paths);
+        let mut ruby_changed = file_paths.iter().any(|path| is_ruby_source(path));
 
         // Files deleted from disk produce no extraction, so the replace-on-
         // reindex path below would never drop their rows — prune them here,
@@ -850,6 +958,10 @@ impl TokenSave {
             if project_root.join(&path).exists() {
                 existing.push(path);
             } else {
+                if is_ruby_template(&path) {
+                    let old = self.db.touched_nodes_by_file(&path).await?;
+                    ruby_changed |= template_changes_reopenings(&path, &old, &[]);
+                }
                 self.db.delete_file(&path).await?;
             }
         }
@@ -886,7 +998,9 @@ impl TokenSave {
         let mut touched = TouchedSet::new();
         for (file_path, result, hash, size, mtime) in &sync_extractions {
             touched.touch_file(file_path);
-            touched.touch_nodes(&self.db.touched_nodes_by_file(file_path).await?);
+            let old_nodes = self.db.touched_nodes_by_file(file_path).await?;
+            ruby_changed |= template_changes_reopenings(file_path, &old_nodes, &result.nodes);
+            touched.touch_nodes(&old_nodes);
             touched.touch_nodes(&node_touch_records(&result.nodes));
             self.db.delete_nodes_by_file(file_path).await?;
             self.db.insert_nodes(&result.nodes).await?;
@@ -954,7 +1068,7 @@ impl TokenSave {
             // references this sync could have changed (#484).
             let incremental = incremental_resolution_enabled();
             let resolution = self
-                .resolve_all_streamed(&resolver, incremental.then_some(&touched))
+                .resolve_all_streamed(&resolver, &touched, incremental)
                 .await?;
             let resolved_refs = &resolution.resolved;
             crate::memstats::record("sync:resolve:refs");
@@ -981,6 +1095,9 @@ impl TokenSave {
             }
         }
 
+        if ruby_changed {
+            self.db.rebuild_ruby_reopenings().await?;
+        }
         self.db.rebuild_trait_dispatch_callers().await?;
         self.db
             .set_metadata("last_sync_at", &current_timestamp().to_string())
@@ -1201,12 +1318,21 @@ impl TokenSave {
         // much as insertions: removing a file takes the edges pointing *into*
         // it with them, and only the touched-name set brings those back.
         let mut touched = TouchedSet::new();
+        // Whether this sync can change the Ruby reopening table; templates
+        // join it below only when they declare a class or module.
+        let mut ruby_changed = removed
+            .iter()
+            .chain(stale.iter())
+            .chain(new_files.iter())
+            .any(|path| is_ruby_source(path));
 
         // Remove deleted files
         for path in &removed {
             on_progress(0, 0, &format!("removing {path}"));
             touched.touch_file(path);
-            touched.touch_nodes(&self.db.touched_nodes_by_file(path).await?);
+            let old_nodes = self.db.touched_nodes_by_file(path).await?;
+            ruby_changed |= template_changes_reopenings(path, &old_nodes, &[]);
+            touched.touch_nodes(&old_nodes);
             self.db.delete_file(path).await?;
         }
 
@@ -1262,7 +1388,9 @@ impl TokenSave {
             total_edges += result.edges.len();
 
             touched.touch_file(file_path);
-            touched.touch_nodes(&self.db.touched_nodes_by_file(file_path).await?);
+            let old_nodes = self.db.touched_nodes_by_file(file_path).await?;
+            ruby_changed |= template_changes_reopenings(file_path, &old_nodes, &result.nodes);
+            touched.touch_nodes(&old_nodes);
             touched.touch_nodes(&node_touch_records(&result.nodes));
             self.db.delete_nodes_by_file(file_path).await?;
             self.db.insert_nodes(&result.nodes).await?;
@@ -1343,7 +1471,7 @@ impl TokenSave {
                 // references this sync could have changed (#484).
                 let incremental = incremental_resolution_enabled();
                 let resolution = self
-                    .resolve_all_streamed(&resolver, incremental.then_some(&touched))
+                    .resolve_all_streamed(&resolver, &touched, incremental)
                     .await?;
                 attempted_refs = resolution.attempted;
                 debug_assert!(resolution.attempted <= resolution.total);
@@ -1378,6 +1506,9 @@ impl TokenSave {
             ));
         }
 
+        if ruby_changed {
+            self.db.rebuild_ruby_reopenings().await?;
+        }
         self.db.rebuild_trait_dispatch_callers().await?;
         let duration_ms = start.elapsed().as_millis() as u64;
         self.db
@@ -1498,6 +1629,11 @@ impl TokenSave {
 
         let mut skipped_map: HashMap<String, usize> = HashMap::new();
         let mut files = self.scan_project_files(&supported_exts, &mut skipped_map);
+        if !self.config.force_include.is_empty() {
+            files.extend(self.scan_force_included_files(&supported_exts));
+            files.sort();
+            files.dedup();
+        }
         // Manifest external entries (absolute / `~` paths) are additive
         // opt-ins indexed under their resolved absolute path (#194).
         if let Some(manifest) = self.manifest() {
@@ -1553,6 +1689,69 @@ impl TokenSave {
         }
     }
 
+    /// Files matched by a `force_include` glob, found without consulting any
+    /// ignore rule (#571).
+    ///
+    /// The `ignore` crate drops a gitignored entry before `filter_entry` sees
+    /// it, so the main walk cannot re-admit one. Its `OverrideBuilder` is no
+    /// help either: a single whitelist override makes every path that matches
+    /// none of them ignored. So each glob gets its own walk, rooted at the
+    /// glob's literal prefix so it stays scoped to what the user listed, and
+    /// the caller merges the result into the main walk's. `exclude` globs,
+    /// the symlink-cycle prune and the size limit still apply.
+    fn scan_force_included_files(&self, supported_exts: &[&str]) -> Vec<String> {
+        let root = &self.project_root;
+        let config = &self.config;
+        let canonical_root = root.canonicalize().ok();
+        // Unsupported-extension tallies were already taken by the main walk.
+        let mut skipped = HashMap::new();
+        let mut files = Vec::new();
+        for pattern in &config.force_include {
+            let base = root.join(crate::config::force_include_base(pattern));
+            if !base.starts_with(root) || !base.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&base)
+                .follow_links(true)
+                .into_iter()
+                .filter_entry(|e| {
+                    if e.path_is_symlink()
+                        && e.file_type().is_dir()
+                        && reenters_project_root(e.path(), canonical_root.as_deref())
+                    {
+                        return false;
+                    }
+                    if e.file_type().is_dir() {
+                        if let Ok(rel) = e.path().strip_prefix(root) {
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if is_excluded_dir(&rel_str, config) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+            {
+                let Ok(entry) = entry else { continue };
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let Ok(rel) = entry.path().strip_prefix(root) else {
+                    continue;
+                };
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if !crate::config::is_force_included(&rel_str, config) {
+                    continue;
+                }
+                if let Some(rel_str) = self.accept_file(entry.path(), supported_exts, &mut skipped)
+                {
+                    files.push(rel_str);
+                }
+            }
+        }
+        files
+    }
+
     /// Walk using `walkdir`, skipping hidden directories and `target/`.
     ///
     /// Hidden (dot-prefixed) entries that match a configured `include` glob
@@ -1585,6 +1784,12 @@ impl TokenSave {
                 }
                 let name = e.file_name().to_string_lossy();
                 if name.starts_with('.') || name == "target" {
+                    // The dependency lockfile is the one hidden file admitted
+                    // without an include glob: committed by convention and
+                    // classified as an artifact by basename downstream.
+                    if !e.file_type().is_dir() && crate::config::is_dependency_lockfile(e.path()) {
+                        return true;
+                    }
                     // Allow if the relative path matches an include glob or a
                     // manifest entry (#194).
                     if let Ok(rel) = e.path().strip_prefix(root) {
@@ -1630,9 +1835,10 @@ impl TokenSave {
     /// additionally treat every `.gitignore` it encounters as a standalone
     /// ignore file, ensuring nested rules are applied even outside a git repo.
     ///
-    /// When `include` globs are configured, the crate's built-in hidden filter
-    /// is disabled and hidden entries are filtered manually so that included
-    /// dot-paths can pass through.
+    /// The crate's built-in hidden filter is disabled and hidden entries are
+    /// filtered manually instead (directories pruned in `filter_entry`, files
+    /// skipped in the walk loop), so that include globs, manifest entries,
+    /// and the dependency lockfile basename can admit specific dot-paths.
     pub(crate) fn scan_files_with_gitignore(
         &self,
         supported_exts: &[&str],
@@ -1640,8 +1846,13 @@ impl TokenSave {
     ) -> Vec<String> {
         let manifest = self.manifest();
         // Manifest entries behave like include globs for hidden-path
-        // filtering, so disable the crate's hidden filter when either exists.
-        let has_includes = !self.config.include.is_empty() || manifest.is_some();
+        // filtering, so the crate's hidden filter is disabled when either
+        // exists — and unconditionally now that the dependency lockfile is
+        // admitted by basename: the crate-level `hidden(true)` filter drops
+        // dot-prefixed entries before `filter_entry` can see them, so the
+        // lockfile exemption below could never run. Hidden-entry semantics
+        // are preserved manually: directories are pruned in `filter_entry`,
+        // files are skipped in the walk loop.
         let mut files = Vec::new();
         // Prune directories covered by an `exclude` glob *before* descending.
         // The `ignore` crate honors `.gitignore` but not our `config.exclude`,
@@ -1653,9 +1864,10 @@ impl TokenSave {
         let root = self.project_root.clone();
         let config = self.config.clone();
         let canonical_root = self.project_root.canonicalize().ok();
+        let manifest_for_prune = manifest.clone();
         let walker = ignore::WalkBuilder::new(&self.project_root)
             .follow_links(true)
-            .hidden(!has_includes) // disable when we need to check includes
+            .hidden(false) // hidden entries are filtered manually below
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
@@ -1666,6 +1878,22 @@ impl TokenSave {
                     if let Ok(rel) = e.path().strip_prefix(&root) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
                         if is_excluded_dir(&rel_str, &config) {
+                            return false;
+                        }
+                    }
+                    // Hidden directories stay pruned exactly as the crate's
+                    // disabled hidden filter pruned them; an include glob or
+                    // manifest entry re-admits one (#194).
+                    if e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.') {
+                        let rel_str = e
+                            .path()
+                            .strip_prefix(&root)
+                            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        let manifest_allows = manifest_for_prune.as_deref().is_some_and(|m| {
+                            m.matches_local_file(&rel_str) || m.local_dir_may_contain(&rel_str)
+                        });
+                        if !is_included(&rel_str, &config) && !manifest_allows {
                             return false;
                         }
                     }
@@ -1690,11 +1918,14 @@ impl TokenSave {
                 continue;
             };
 
-            // When we disabled the crate's hidden filter, manually skip hidden
-            // entries that don't match an include glob.
-            if has_includes && entry.depth() > 0 {
+            // The crate's hidden filter is disabled (see above), so hidden
+            // files are skipped manually unless an include glob or manifest
+            // entry admits them — with one exemption: the dependency
+            // lockfile, admitted by basename so it can be tracked as an
+            // artifact without an include glob.
+            if entry.depth() > 0 && ft.is_file() {
                 let name = entry.file_name().to_string_lossy();
-                if name.starts_with('.') {
+                if name.starts_with('.') && !crate::config::is_dependency_lockfile(entry.path()) {
                     if let Ok(rel) = entry.path().strip_prefix(&self.project_root) {
                         let rel_str = rel.to_string_lossy().replace('\\', "/");
                         let manifest_allows = manifest.as_deref().is_some_and(|m| {
@@ -1742,7 +1973,12 @@ impl TokenSave {
             let manifest_match = self
                 .manifest()
                 .is_some_and(|m| m.matches_local_file(&rel_str));
-            if !manifest_match {
+            // Dependency lockfiles are admitted by basename (#497 follow-up):
+            // `.terraform.lock.hcl` is tracked as an artifact even though no
+            // extractor or artifact extension owns `.hcl`, and it must not
+            // count toward the unsupported-extension summary.
+            let lockfile_match = crate::config::is_dependency_lockfile(path);
+            if !manifest_match && !lockfile_match {
                 if !ext.is_empty() && !is_excluded(&rel_str, &self.config) {
                     let ext_lower = ext.to_ascii_lowercase();
                     if !NON_SOURCE_EXTS.contains(&ext_lower.as_str()) {
@@ -1957,15 +2193,22 @@ impl TokenSave {
     /// Artifacts are never handed to the extractor: they have no symbols by
     /// definition, and routing them through extraction would mean teaching both
     /// the in-process and subprocess paths to return an empty result.
+    ///
+    /// A path is an artifact when its extension is configured as one or when
+    /// its basename names a dependency lockfile (`is_dependency_lockfile`):
+    /// the lockfile's `.hcl` extension is deliberately not an artifact
+    /// extension, since that would classify every HCL document as one.
     pub(crate) fn partition_artifacts(
         files: Vec<String>,
         artifact_exts: &[String],
     ) -> (Vec<String>, Vec<String>) {
         files.into_iter().partition(|path| {
-            !std::path::Path::new(path)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| artifact_exts.contains(&ext.to_ascii_lowercase()))
+            let path_ref = std::path::Path::new(path);
+            !crate::config::is_dependency_lockfile(path_ref)
+                && !path_ref
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| artifact_exts.contains(&ext.to_ascii_lowercase()))
         })
     }
 
@@ -2075,6 +2318,13 @@ impl TokenSave {
         let size = source.len() as u64;
         let mtime = sync::file_stat(&abs_path).map_or_else(current_timestamp, |(m, _)| m);
 
+        let ruby_changed = is_ruby_source(file_path)
+            || (is_ruby_template(file_path)
+                && template_changes_reopenings(
+                    file_path,
+                    &self.db.touched_nodes_by_file(file_path).await?,
+                    &result.nodes,
+                ));
         self.db.delete_nodes_by_file(file_path).await?;
         self.db.insert_nodes(&result.nodes).await?;
         let body_documents = build_executable_body_documents(file_path, &source, &result.nodes);
@@ -2098,9 +2348,22 @@ impl TokenSave {
             kind: FileKind::Code,
         };
         self.db.upsert_file(&file_record).await?;
+        if ruby_changed {
+            self.db.rebuild_ruby_reopenings().await?;
+        }
         self.db.rebuild_trait_dispatch_callers().await?;
 
         Ok(())
+    }
+
+    /// 1-based inclusive line range covered by a byte span in `source`.
+    fn byte_span_lines(source: &str, start: usize, end: usize) -> (u32, u32) {
+        let start_line = source[..start].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        let mut end_line = source[..end].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+        if end > start && source.as_bytes()[end - 1] == b'\n' {
+            end_line = end_line.saturating_sub(1);
+        }
+        (start_line, end_line.max(start_line))
     }
 
     /// Performs a single string replacement.
@@ -2128,6 +2391,11 @@ impl TokenSave {
         let matches: Vec<_> = source.match_indices(old_str).collect();
         match matches.len() {
             0 => {
+                let needle = crate::text::utf8_prefix_at_or_before(old_str, 20);
+                let nearest = source
+                    .lines()
+                    .find(|line| line.contains(needle))
+                    .map(str::to_string);
                 return Ok(EditResult {
                     success: false,
                     file_path: display_path,
@@ -2135,7 +2403,10 @@ impl TokenSave {
                     matched_str: old_str.to_string(),
                     new_str: new_str.to_string(),
                     message: format!("old_str not found in {path}"),
-                })
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest,
+                });
             }
             1 => {}
             n => {
@@ -2146,10 +2417,14 @@ impl TokenSave {
                     matched_str: old_str.to_string(),
                     new_str: new_str.to_string(),
                     message: format!("old_str matches {n} times, must match exactly once"),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 })
             }
         }
 
+        let match_start = matches[0].0;
         let modified = source.replacen(old_str, new_str, 1);
 
         tokio::fs::write(&abs_path, &modified)
@@ -2158,8 +2433,26 @@ impl TokenSave {
                 message: format!("failed to write {resolved_path}: {e}"),
             })?;
 
+        let changed_lines =
+            Self::byte_span_lines(&source, match_start, match_start + old_str.len());
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
+
         if let Some(rel) = &rel_path {
-            self.reindex_file(rel).await?;
+            if let Err(e) = self.reindex_file(rel).await {
+                // The write landed; do not report a bare failure that makes
+                // the caller think nothing changed and retry (#563).
+                return Ok(EditResult {
+                    success: false,
+                    file_path: display_path,
+                    resolved_path,
+                    matched_str: old_str.to_string(),
+                    new_str: new_str.to_string(),
+                    message: format!("write landed but reindex failed: {e}"),
+                    changed_lines,
+                    digest,
+                    nearest: None,
+                });
+            }
         }
 
         Ok(EditResult {
@@ -2169,6 +2462,9 @@ impl TokenSave {
             matched_str: old_str.to_string(),
             new_str: new_str.to_string(),
             message: "replacement successful".to_string(),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 
@@ -2275,6 +2571,9 @@ impl TokenSave {
                         "line number {line_num} out of range (file has {} lines)",
                         lines.len()
                     ),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 });
             }
             line_num - 1
@@ -2288,6 +2587,10 @@ impl TokenSave {
                 .collect();
 
             if matching_lines.is_empty() {
+                let nearest = lines
+                    .iter()
+                    .find(|line| line.contains(anchor_prefix))
+                    .map(|line| (*line).to_string());
                 return Ok(InsertResult {
                     success: false,
                     file_path: display_path,
@@ -2296,6 +2599,9 @@ impl TokenSave {
                     content: content.to_string(),
                     before,
                     message: format!("anchor '{anchor}' not found"),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest,
                 });
             }
             if matching_lines.len() > 1 {
@@ -2310,6 +2616,9 @@ impl TokenSave {
                         "anchor '{anchor}' matches {} lines, must match exactly one",
                         matching_lines.len()
                     ),
+                    changed_lines: (0, 0),
+                    digest: String::new(),
+                    nearest: None,
                 });
             }
             matching_lines[0]
@@ -2334,6 +2643,14 @@ impl TokenSave {
             self.reindex_file(rel).await?;
         }
 
+        let start_line = if before {
+            (anchor_line + 1) as u32
+        } else {
+            (anchor_line + 2) as u32
+        };
+        let end_line = start_line + content.matches('\n').count() as u32;
+        let changed_lines = (start_line, end_line);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(InsertResult {
             success: true,
             file_path: display_path,
@@ -2342,6 +2659,9 @@ impl TokenSave {
             content: content.to_string(),
             before,
             message: format!("inserted at line {}", anchor_line + 1),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 
@@ -2384,6 +2704,9 @@ impl TokenSave {
                     target.end_line,
                     lines.len()
                 ),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
             });
         }
         let trailing_newline = source.ends_with('\n');
@@ -2403,6 +2726,8 @@ impl TokenSave {
         if let Some(rel) = &rel_path {
             self.reindex_file(rel).await?;
         }
+        let changed_lines = (target.start_line + 1, target.end_line + 1);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(EditResult {
             success: true,
             file_path: display_path,
@@ -2415,6 +2740,207 @@ impl TokenSave {
                 target.start_line + 1,
                 target.end_line + 1
             ),
+            changed_lines,
+            digest,
+            nearest: None,
+        })
+    }
+
+    /// Deletes a named symbol, including its leading doc comment/attribute
+    /// block and one adjacent blank line. Resolves the symbol via exact
+    /// qualified-name match — if the name is ambiguous, callable definitions
+    /// win; if still ambiguous after that filter, the edit is refused so we
+    /// don't clobber the wrong site.
+    ///
+    /// `root_override` retargets where the symbol's (index-relative) file
+    /// path is written to — e.g. a git worktree that shares the same
+    /// relative layout as the indexed project root but lives at a different
+    /// absolute location. See [`Self::resolve_edit_target`] for semantics.
+    pub async fn delete_symbol(
+        &self,
+        symbol: &str,
+        include_doc_comment: bool,
+        root_override: Option<&str>,
+    ) -> Result<EditResult> {
+        let target = resolve_symbol_for_edit(self, symbol).await?;
+        let (abs_path, rel_path) = self.resolve_edit_target(&target.file_path, root_override);
+        let resolved_path = abs_path.to_string_lossy().to_string();
+        let display_path = rel_path.clone().unwrap_or_else(|| resolved_path.clone());
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| TokenSaveError::Config {
+            message: format!("failed to read {resolved_path}: {e}"),
+        })?;
+        let lines: Vec<&str> = source.lines().collect();
+        let mut start = if include_doc_comment {
+            target.attrs_start_line as usize
+        } else {
+            target.start_line as usize
+        };
+        if include_doc_comment {
+            // `attrs_start_line` covers attributes but not every language's
+            // doc-comment marker, so scan upward for a contiguous doc-comment
+            // block directly above the symbol and include it when present.
+            let mut doc_start = target.start_line as usize;
+            while doc_start > 0 {
+                let line = lines[doc_start - 1].trim();
+                if line.starts_with("///")
+                    || line.starts_with("/**")
+                    || line.starts_with("/*")
+                    || line.starts_with('#')
+                    || line.starts_with("--")
+                    || line.starts_with(';')
+                    || line.starts_with('\'')
+                    || line.starts_with('"')
+                {
+                    doc_start -= 1;
+                } else {
+                    break;
+                }
+            }
+            start = start.min(doc_start);
+        }
+        let end_inclusive = (target.end_line as usize).min(lines.len().saturating_sub(1));
+        if start >= lines.len() || start > end_inclusive {
+            return Ok(EditResult {
+                success: false,
+                file_path: display_path,
+                resolved_path,
+                matched_str: symbol.to_string(),
+                new_str: String::new(),
+                message: format!(
+                    "symbol range [{}..={}] out of bounds for {}-line file",
+                    target.start_line,
+                    target.end_line,
+                    lines.len()
+                ),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
+            });
+        }
+        let mut remove_start = start;
+        let mut remove_end = end_inclusive;
+        if remove_end + 1 < lines.len() && lines[remove_end + 1].trim().is_empty() {
+            remove_end += 1;
+        } else if remove_start > 0 && lines[remove_start - 1].trim().is_empty() {
+            remove_start -= 1;
+        }
+        let mut rebuilt: Vec<String> = Vec::with_capacity(lines.len());
+        rebuilt.extend(lines[..remove_start].iter().map(|s| (*s).to_string()));
+        rebuilt.extend(lines[remove_end + 1..].iter().map(|s| (*s).to_string()));
+        let mut modified = rebuilt.join("\n");
+        if source.ends_with('\n') && !rebuilt.is_empty() {
+            modified.push('\n');
+        }
+        tokio::fs::write(&abs_path, &modified)
+            .await
+            .map_err(|e| TokenSaveError::Config {
+                message: format!("failed to write {resolved_path}: {e}"),
+            })?;
+        if let Some(rel) = &rel_path {
+            self.reindex_file(rel).await?;
+        }
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
+        Ok(EditResult {
+            success: true,
+            file_path: display_path,
+            resolved_path,
+            matched_str: symbol.to_string(),
+            new_str: String::new(),
+            message: format!(
+                "deleted {}:{}-{}",
+                target.file_path,
+                remove_start + 1,
+                remove_end + 1
+            ),
+            changed_lines: ((remove_start + 1) as u32, (remove_end + 1) as u32),
+            digest,
+            nearest: None,
+        })
+    }
+
+    /// Replaces a contiguous 1-based inclusive line range in a file with
+    /// `new_content`. `expected_digest` (from `tokensave_read`) makes a stale
+    /// range fail instead of corrupting the file; `new_content: ""` deletes
+    /// the block.
+    ///
+    /// `root_override` retargets resolution of a *relative* `path` to a
+    /// directory other than the indexed project root (e.g. a git worktree).
+    /// An absolute `path` is always honored verbatim regardless of this
+    /// parameter. See [`Self::resolve_edit_target`] for full semantics.
+    pub async fn replace_lines(
+        &self,
+        path: &str,
+        start: u32,
+        end: u32,
+        new_content: &str,
+        expected_digest: Option<&str>,
+        root_override: Option<&str>,
+    ) -> Result<LineReplaceResult> {
+        let (abs_path, rel_path) = self.resolve_edit_target(path, root_override);
+        let resolved_path = abs_path.to_string_lossy().to_string();
+        let display_path = rel_path.clone().unwrap_or_else(|| resolved_path.clone());
+        let source = std::fs::read_to_string(&abs_path).map_err(|e| TokenSaveError::Config {
+            message: format!("failed to read {resolved_path}: {e}"),
+        })?;
+        let before_digest = crate::context::read_cache::digest_bytes(source.as_bytes());
+        if let Some(expected) = expected_digest {
+            if before_digest != expected {
+                return Ok(LineReplaceResult {
+                    success: false,
+                    file_path: display_path,
+                    resolved_path,
+                    changed_lines: (0, 0),
+                    digest: before_digest.clone(),
+                    message: format!("digest mismatch: expected {expected}, got {before_digest}"),
+                });
+            }
+        }
+        let lines: Vec<&str> = source.lines().collect();
+        let start_idx = start.saturating_sub(1) as usize;
+        let end_idx = (end as usize).min(lines.len());
+        if start == 0 || start_idx >= lines.len() || start_idx >= end_idx {
+            return Ok(LineReplaceResult {
+                success: false,
+                file_path: display_path,
+                resolved_path,
+                changed_lines: (0, 0),
+                digest: before_digest,
+                message: format!(
+                    "line range {start}-{end} out of bounds (file has {} lines)",
+                    lines.len()
+                ),
+            });
+        }
+        let trailing_newline = source.ends_with('\n');
+        let mut rebuilt: Vec<String> = Vec::with_capacity(lines.len());
+        rebuilt.extend(lines[..start_idx].iter().map(|s| (*s).to_string()));
+        let replacement = new_content.trim_end_matches('\n');
+        if !replacement.is_empty() {
+            rebuilt.push(replacement.to_string());
+        }
+        rebuilt.extend(lines[end_idx..].iter().map(|s| (*s).to_string()));
+        let mut modified = rebuilt.join("\n");
+        // Deleting the whole file leaves `rebuilt` empty; do not invent a
+        // trailing newline for an empty result (#564).
+        if trailing_newline && !modified.is_empty() {
+            modified.push('\n');
+        }
+        tokio::fs::write(&abs_path, &modified)
+            .await
+            .map_err(|e| TokenSaveError::Config {
+                message: format!("failed to write {resolved_path}: {e}"),
+            })?;
+        if let Some(rel) = &rel_path {
+            self.reindex_file(rel).await?;
+        }
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
+        Ok(LineReplaceResult {
+            success: true,
+            file_path: display_path,
+            resolved_path,
+            changed_lines: (start, end),
+            digest,
+            message: format!("replaced lines {start}-{end}"),
         })
     }
 
@@ -2462,6 +2988,9 @@ impl TokenSave {
                 content: content.to_string(),
                 before,
                 message: format!("anchor line {anchor_line} past EOF ({})", lines.len()),
+                changed_lines: (0, 0),
+                digest: String::new(),
+                nearest: None,
             });
         }
         let trailing_newline = source.ends_with('\n');
@@ -2481,6 +3010,10 @@ impl TokenSave {
         if let Some(rel) = &rel_path {
             self.reindex_file(rel).await?;
         }
+        let start_line = (anchor_line + 1) as u32;
+        let end_line = start_line + content.matches('\n').count() as u32;
+        let changed_lines = (start_line, end_line);
+        let digest = crate::context::read_cache::digest_bytes(modified.as_bytes());
         Ok(InsertResult {
             success: true,
             file_path: display_path,
@@ -2495,6 +3028,9 @@ impl TokenSave {
                 target.kind.as_str(),
                 anchor_line + 1
             ),
+            changed_lines,
+            digest,
+            nearest: None,
         })
     }
 

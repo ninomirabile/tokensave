@@ -5,8 +5,7 @@ use tokensave::agents::{
     AgentIntegration, DoctorCounters, HealthcheckContext, OpenCodeIntegration,
 };
 
-mod common;
-use common::{make_install_ctx as make_ctx, read_json};
+use crate::common::{make_install_ctx as make_ctx, read_json};
 
 fn opencode_config_path(home: &Path) -> std::path::PathBuf {
     home.join(".config/opencode/opencode.json")
@@ -678,4 +677,43 @@ fn test_has_tokensave_with_config_but_no_mcp() {
 fn test_name_and_id() {
     assert_eq!(OpenCodeIntegration.name(), "OpenCode");
     assert_eq!(OpenCodeIntegration.id(), "opencode");
+}
+
+#[test]
+fn test_opencode_v2_servers_install_and_healthcheck() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+
+    // Pre-populate opencode.json with OpenCode v2 structure (mcp.servers)
+    let config_path = opencode_config_path(home);
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config_path,
+        r#"{"plugins": [], "mcp": {"servers": {"other": {"type": "local", "command": ["other"]}}}}"#,
+    )
+    .unwrap();
+
+    let ctx = make_ctx(home);
+    OpenCodeIntegration.install(&ctx).unwrap();
+
+    let config = read_json(&config_path);
+    assert!(config["mcp"]["servers"]["other"].is_object());
+    assert!(config["mcp"]["servers"]["tokensave"].is_object());
+    assert!(OpenCodeIntegration.has_tokensave(home));
+
+    let mut dc = DoctorCounters::new();
+    let hctx = HealthcheckContext {
+        home: home.to_path_buf(),
+        project_path: home.to_path_buf(),
+    };
+    OpenCodeIntegration.healthcheck(&mut dc, &hctx);
+    assert_eq!(
+        dc.issues, 0,
+        "healthcheck should pass on v2 mcp.servers config"
+    );
+
+    OpenCodeIntegration.uninstall(&ctx).unwrap();
+    let config_after = read_json(&config_path);
+    assert!(config_after["mcp"]["servers"]["other"].is_object());
+    assert!(config_after["mcp"]["servers"].get("tokensave").is_none());
 }

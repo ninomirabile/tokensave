@@ -26,6 +26,30 @@ use crate::tokensave::TokenSave;
 
 use super::{ToolResult, MAX_RESPONSE_CHARS};
 
+/// Session-scoped state shared across tool calls in one MCP server session.
+///
+/// `unscanned_shown` tracks which project roots have already received the
+/// full `unscanned` detail block from a literal search, so later searches in
+/// the same session can return a compact count instead of repeating the
+/// extension histogram (#561).
+pub struct SessionState {
+    pub unscanned_shown: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl SessionState {
+    pub fn new() -> Self {
+        Self {
+            unscanned_shown: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Converts a stored 0-based line (tree-sitter row, the convention every
 /// extractor writes to the DB) into the 1-based editor line used in every
 /// user-facing response (#203). Internal span comparisons stay 0-based;
@@ -206,8 +230,13 @@ pub(crate) async fn sibling_note(
 
 /// Truncates a string to the maximum response character limit, appending
 /// a truncation notice if necessary.
+///
+/// An empty input is a legitimate answer — a valid filter that matched
+/// nothing — and is returned unchanged. It used to trip a `debug_assert`,
+/// which killed the whole server in a debug build while a release build
+/// returned an empty text block, so the two profiles disagreed on a request
+/// that was never invalid (#499).
 pub(crate) fn truncate_response(s: &str) -> String {
-    debug_assert!(!s.is_empty(), "truncate_response called with empty string");
     if s.len() <= MAX_RESPONSE_CHARS {
         s.to_string()
     } else {
@@ -429,17 +458,36 @@ fn normalize_path_args(args: &mut Value, preserve_drive_absolute: bool) {
     }
 }
 
+/// Dispatches a tool call to the appropriate handler, without session state.
+///
+/// Kept as a thin wrapper so existing callers (tests, CLI paths) keep working;
+/// the server passes session state through [`handle_tool_call_with_session`].
+pub async fn handle_tool_call(
+    cg: &TokenSave,
+    tool_name: &str,
+    args: Value,
+    server_stats: Option<Value>,
+    scope_prefix: Option<&str>,
+) -> Result<ToolResult> {
+    handle_tool_call_with_session(cg, tool_name, args, server_stats, scope_prefix, false, None)
+        .await
+}
+
 /// Dispatches a tool call to the appropriate handler.
 ///
 /// Returns the tool result and touched file paths, or an error if the tool
 /// name is unknown or the handler fails. The optional `server_stats` value
-/// is included in `tokensave_status` responses when provided.
-pub async fn handle_tool_call(
+/// is included in `tokensave_status` responses when provided. `session`
+/// carries per-session state (e.g. which roots already showed the full
+/// `unscanned` detail block).
+pub async fn handle_tool_call_with_session(
     cg: &TokenSave,
     tool_name: &str,
     mut args: Value,
     server_stats: Option<Value>,
     scope_prefix: Option<&str>,
+    selected_graph: bool,
+    session: Option<&SessionState>,
 ) -> Result<ToolResult> {
     normalize_path_args(
         &mut args,
@@ -454,13 +502,15 @@ pub async fn handle_tool_call(
         "tool_name must start with 'tokensave_' prefix"
     );
     match tool_name {
-        "tokensave_search" => graph::handle_search(cg, args, scope_prefix).await,
+        "tokensave_search" => graph::handle_search(cg, args, scope_prefix, session).await,
         "tokensave_context" => graph::handle_context(cg, args, scope_prefix).await,
         "tokensave_callers" => graph::handle_callers(cg, args).await,
         "tokensave_callees" => graph::handle_callees(cg, args).await,
         "tokensave_impact" => graph::handle_impact(cg, args).await,
         "tokensave_node" => graph::handle_node(cg, args).await,
-        "tokensave_status" => info::handle_status(cg, server_stats, scope_prefix).await,
+        "tokensave_status" => {
+            info::handle_status(cg, server_stats, scope_prefix, selected_graph).await
+        }
         "tokensave_files" => info::handle_files(cg, args, scope_prefix).await,
         "tokensave_affected" => git::handle_affected(cg, args).await,
         "tokensave_dead_code" => analysis::handle_dead_code(cg, args, scope_prefix).await,
@@ -474,7 +524,8 @@ pub async fn handle_tool_call(
         "tokensave_imports" => analysis::handle_imports(cg, args).await,
         "tokensave_hotspots" => analysis::handle_hotspots(cg, args, scope_prefix).await,
         "tokensave_similar" => graph::handle_similar(cg, args).await,
-        "tokensave_rename_preview" => graph::handle_rename_preview(cg, args).await,
+        "tokensave_rename_preview" => edit::handle_rename_preview(cg, args).await,
+        "tokensave_rename" => edit::handle_rename(cg, args).await,
         "tokensave_unused_imports" => analysis::handle_unused_imports(cg, args, scope_prefix).await,
         "tokensave_rank" => analysis::handle_rank(cg, args, scope_prefix).await,
         "tokensave_largest" => analysis::handle_largest(cg, args, scope_prefix).await,
@@ -502,6 +553,8 @@ pub async fn handle_tool_call(
         "tokensave_str_replace" => edit::handle_str_replace(cg, args).await,
         "tokensave_multi_str_replace" => edit::handle_multi_str_replace(cg, args).await,
         "tokensave_insert_at" => edit::handle_insert_at(cg, args).await,
+        "tokensave_delete_symbol" => edit::handle_delete_symbol(cg, args).await,
+        "tokensave_replace_lines" => edit::handle_replace_lines(cg, args).await,
         "tokensave_ast_grep_rewrite" => edit::handle_ast_grep_rewrite(cg, args).await,
         "tokensave_gini" => health::handle_gini(cg, args, scope_prefix).await,
         "tokensave_dependency_depth" => {
@@ -682,9 +735,9 @@ mod tests {
         // tool that will instantly fail. The count and the per-tool checks
         // below adapt to the host's capability set.
         let expected_total = if super::super::definitions::ast_grep_available() {
-            85
+            88
         } else {
-            84
+            87
         };
         assert_eq!(tools.len(), expected_total);
 
@@ -715,6 +768,7 @@ mod tests {
         assert!(tool_names.contains(&"tokensave_hotspots"));
         assert!(tool_names.contains(&"tokensave_similar"));
         assert!(tool_names.contains(&"tokensave_rename_preview"));
+        assert!(tool_names.contains(&"tokensave_rename"));
         assert!(tool_names.contains(&"tokensave_unused_imports"));
         assert!(tool_names.contains(&"tokensave_changelog"));
         assert!(tool_names.contains(&"tokensave_rank"));
@@ -807,6 +861,9 @@ mod tests {
             "tokensave_replace_symbol",
             "tokensave_insert_at_symbol",
             "tokensave_run_affected_tests",
+            "tokensave_delete_symbol",
+            "tokensave_replace_lines",
+            "tokensave_rename",
         ];
         for tool in &tools {
             let ann = tool

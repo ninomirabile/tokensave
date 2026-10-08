@@ -126,6 +126,31 @@ fn format_greeting(name: &str) -> String {
     assert!(stats.edge_count > 0, "should have edges");
 }
 
+/// A full index records the version that built the graph, so consumers can
+/// tell "graph built by X" as a fact rather than inferring it from
+/// `last_indexed_version` (#554).
+#[tokio::test]
+async fn test_full_index_records_build_version() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path();
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn helper() -> i32 { 42 }\n",
+    )
+    .unwrap();
+
+    let cg = TokenSave::init(project).await.unwrap();
+    cg.index_all().await.unwrap();
+
+    let stats = cg.get_stats().await.unwrap();
+    assert_eq!(
+        stats.last_full_index_version,
+        env!("CARGO_PKG_VERSION"),
+        "a full index must record the running version as the graph builder"
+    );
+}
+
 #[tokio::test]
 async fn test_incremental_sync() {
     let dir = TempDir::new().unwrap();
@@ -1545,12 +1570,12 @@ async fn test_index_all_reports_skipped_extensions() {
     let dir = TempDir::new().unwrap();
     let project = dir.path();
 
-    // Originally used `.v`, which #344 has since made a supported extension.
-    // VHDL keeps the case honest: a real hardware language with no extractor.
+    // Originally used `.v` and then `.vhd`; both have since gained an
+    // extractor. Ada keeps the case honest: a real language with no extractor.
     fs::write(project.join("README.md"), "# readme\n").unwrap();
     fs::write(
-        project.join("example.vhd"),
-        "entity example is\nend example;\n",
+        project.join("example.adb"),
+        "procedure Example is\nbegin\n   null;\nend Example;\n",
     )
     .unwrap();
 
@@ -1559,7 +1584,7 @@ async fn test_index_all_reports_skipped_extensions() {
 
     assert_eq!(
         result.skipped_extensions,
-        vec![("vhd".to_string(), 1)],
+        vec![("adb".to_string(), 1)],
         "skipped_extensions: {:?}",
         result.skipped_extensions
     );

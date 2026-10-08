@@ -1,4 +1,4 @@
-use clap::{builder::PossibleValuesParser, Parser, Subcommand};
+use clap::{builder::PossibleValuesParser, ArgAction, Parser, Subcommand};
 
 fn agent_value_parser() -> PossibleValuesParser {
     PossibleValuesParser::new(tokensave::agents::available_integrations())
@@ -95,15 +95,24 @@ pub enum Commands {
     /// Configure agent integration (MCP server, permissions, hooks, prompt rules)
     #[command(name = "install", visible_alias = "claude-install")]
     Install {
-        /// Agent to configure (auto-detects if omitted)
-        #[arg(long, value_parser = agent_value_parser())]
-        agent: Option<String>,
-        /// Whether to install global git `post-commit` + `post-merge` hooks
-        /// that run `tokensave sync` after each commit and after `git pull`
-        /// (plus a `post-checkout` hook for fresh clones/branch tracking).
+        /// Agent to configure (auto-detects if omitted, prompts interactively
+        /// when several are detected). Repeat the flag to install several
+        /// agents in a single run, e.g.
+        /// `tokensave install --agent claude --agent cursor` (#640).
+        #[arg(long, value_parser = agent_value_parser(), action = ArgAction::Append, num_args = 1)]
+        agent: Vec<String>,
+        /// Whether to install git `post-commit` + `post-merge` hooks that run
+        /// `tokensave sync` after each commit and after `git pull` (plus a
+        /// `post-checkout` hook for fresh clones/branch tracking).
+        ///
         /// `default` preserves the interactive prompt (or silent skip on
-        /// non-TTY). `yes` installs the hooks without asking; `no` skips
-        /// them without asking.
+        /// non-TTY). `yes` installs without asking; `no` skips without asking.
+        /// Both install into the **current repository** (#506).
+        ///
+        /// `global` instead claims `core.hooksPath`, a single machine-wide
+        /// setting that forces one hook directory on every repository — which
+        /// also takes the slot from every other hook installer, so `git lfs
+        /// install --local`, husky and pre-commit will fail while it is held.
         #[arg(long, value_enum, default_value_t = GitHookMode::Default)]
         git_hook: GitHookMode,
         /// Install into the current project's config instead of the user's
@@ -156,9 +165,24 @@ pub enum Commands {
     /// Extraction worker (spawned by tokensave itself; not for direct use).
     #[command(name = "extract-worker", hide = true)]
     ExtractWorker,
+    /// post-checkout git hook handler (called by the installed hook, not by
+    /// users directly).
+    ///
+    /// Takes git's three post-checkout arguments — previous HEAD, new HEAD,
+    /// and the branch-checkout flag. Since #342 Q1 the installed hook is a
+    /// single line delegating here, so the decision of what a checkout should
+    /// trigger lives in the binary and ships with it.
+    #[command(name = "hook", hide = true)]
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
     /// PreToolUse hook handler (called by Claude Code, not by users directly)
     #[command(name = "hook-pre-tool-use", hide = true)]
     HookPreToolUse,
+    /// Codex PreToolUse hook handler (called by Codex, not by users directly)
+    #[command(name = "hook-pre-tool-use-codex", hide = true)]
+    HookPreToolUseCodex,
     /// UserPromptSubmit hook handler (resets session counter)
     #[command(name = "hook-prompt-submit", hide = true)]
     HookPromptSubmit,
@@ -271,6 +295,22 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
     },
+    /// Audit bare-name resolution quality over the built index
+    ///
+    /// Counts cross-file edges resolved through the bare-name path whose
+    /// target is the sole symbol of that name — the population the
+    /// reachability gate governs. Read it comparatively: index a tree at two
+    /// commits and diff the counts. Unlike a production-to-`tests/` count it
+    /// also sees phantoms landing inside production, and needs no
+    /// test/production classification, so it is not sensitive to layout.
+    AuditEdges {
+        /// How many of the most-collided targets to list
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Check tokensave installation, configuration, and agent integration
     Doctor {
         /// Check only this agent (default: all agents)
@@ -380,6 +420,96 @@ mod tests {
             _ => panic!("expected Cost command"),
         }
     }
+
+    /// `#640`: `tokensave install --agent claude --agent cursor` must parse
+    /// into a single Install command holding both agents, in the order the
+    /// user typed them. Single-agent and flagless parses must still work.
+    #[test]
+    fn parse_install_multiple_agents() {
+        let cli = Cli::try_parse_from([
+            "tokensave",
+            "install",
+            "--agent",
+            "claude",
+            "--agent",
+            "cursor",
+        ])
+        .expect("parse failed");
+        match cli.command {
+            Some(Commands::Install {
+                agent,
+                local,
+                git_hook,
+                wildcard_permissions,
+                explicit_permissions,
+            }) => {
+                assert_eq!(agent, vec!["claude".to_string(), "cursor".to_string()]);
+                assert!(!local);
+                assert_eq!(git_hook, tokensave::agents::GitHookMode::Default);
+                assert!(!wildcard_permissions);
+                assert!(!explicit_permissions);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_single_agent() {
+        let cli = Cli::try_parse_from(["tokensave", "install", "--agent", "claude"])
+            .expect("parse failed");
+        match cli.command {
+            Some(Commands::Install { agent, .. }) => {
+                assert_eq!(agent, vec!["claude".to_string()]);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_no_agent_still_parses() {
+        let cli = Cli::try_parse_from(["tokensave", "install"]).expect("parse failed");
+        match cli.command {
+            Some(Commands::Install { agent, .. }) => {
+                assert!(agent.is_empty(), "omitted --agent must yield empty Vec");
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    /// A bare `--agent` with no value must be rejected rather than silently
+    /// falling back to auto-detection.
+    #[test]
+    fn parse_install_bare_agent_flag_is_rejected() {
+        let err_kind = match Cli::try_parse_from(["tokensave", "install", "--agent"]) {
+            Ok(_) => panic!("parse should fail for --agent without a value"),
+            Err(e) => e.kind(),
+        };
+        assert!(
+            err_kind == clap::error::ErrorKind::InvalidValue
+                || err_kind == clap::error::ErrorKind::WrongNumberOfValues
+                || err_kind == clap::error::ErrorKind::TooFewValues,
+            "expected a missing-value error, got {:?}",
+            err_kind
+        );
+    }
+
+    /// Each `--agent` value is still validated against the known integration
+    /// id list, so a typo or an unknown slug is rejected at parse time rather
+    /// than mid-install.
+    #[test]
+    fn parse_install_unknown_agent_is_rejected() {
+        let err_kind =
+            match Cli::try_parse_from(["tokensave", "install", "--agent", "not-a-real-agent"]) {
+                Ok(_) => panic!("parse should fail for an unknown agent id"),
+                Err(e) => e.kind(),
+            };
+        assert!(
+            err_kind == clap::error::ErrorKind::ValueValidation
+                || err_kind == clap::error::ErrorKind::InvalidValue,
+            "expected a value-validation error, got {:?}",
+            err_kind
+        );
+    }
 }
 
 #[derive(Subcommand)]
@@ -427,5 +557,23 @@ pub enum BranchAction {
         /// Project path (default: current directory)
         #[arg(short, long)]
         path: Option<String>,
+    },
+}
+
+/// Git hook handlers invoked by the installed hook scripts.
+#[derive(clap::Subcommand, Debug)]
+pub enum HookAction {
+    /// Handle a git `post-checkout` event.
+    PostCheckout {
+        /// Previous HEAD (git's `$1`). The all-zeros sentinel marks the
+        /// initial checkout of a fresh clone or a new worktree.
+        prev_head: Option<String>,
+        /// New HEAD (git's `$2`). Unused today; accepted so the hook can pass
+        /// `"$@"` through verbatim and the signature does not have to change
+        /// when it is needed.
+        new_head: Option<String>,
+        /// Branch-checkout flag (git's `$3`): `1` for a branch checkout, `0`
+        /// for a file checkout.
+        branch_flag: Option<String>,
     },
 }

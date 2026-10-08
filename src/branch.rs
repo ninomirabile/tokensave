@@ -136,6 +136,57 @@ fn current_branch_git(project_root: &Path) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+/// Returns the set of local branch names, or `None` when the refs could not
+/// be enumerated at all.
+///
+/// The distinction matters to every caller that deletes something: an empty
+/// set means the repository genuinely has no branches, while `None` means we
+/// do not know, and "we do not know" must never be read as "nothing exists".
+///
+/// This asks git rather than looking for `.git/refs/heads/<name>` on disk
+/// (#501). That probe is wrong in two common layouts: inside a linked
+/// worktree `.git` is a *file* pointing at the real git directory, so the
+/// path never exists; and a `reftable` repository stores no loose refs at
+/// all. In both, every branch looked deleted.
+pub fn local_branches(project_root: &Path) -> Option<std::collections::HashSet<String>> {
+    if let Some(branches) = local_branches_gix(project_root) {
+        return Some(branches);
+    }
+    local_branches_git(project_root)
+}
+
+fn local_branches_gix(project_root: &Path) -> Option<std::collections::HashSet<String>> {
+    let repo = gix::open(project_root).ok()?;
+    let platform = repo.references().ok()?;
+    let iter = platform.local_branches().ok()?;
+    let mut out = std::collections::HashSet::new();
+    for reference in iter.flatten() {
+        let name = reference.name().as_bstr().to_string();
+        if let Some(short) = name.strip_prefix("refs/heads/") {
+            out.insert(short.to_string());
+        }
+    }
+    Some(out)
+}
+
+fn local_branches_git(project_root: &Path) -> Option<std::collections::HashSet<String>> {
+    let output = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:strip=2)", "refs/heads"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(std::string::ToString::to_string)
+            .collect(),
+    )
+}
+
 /// Auto-detects the default branch (main or master).
 ///
 /// Strategy:
@@ -327,6 +378,10 @@ pub async fn track_branch_copy(
 
     // No metadata → single-DB mode. Do NOT bootstrap tracking implicitly here;
     // that is `branch add`'s job. Preserves backward-compatible behavior.
+    if branch_meta::load_branch_meta(tokensave_dir).is_none() {
+        return Ok(false);
+    }
+    let _branch_lock = crate::tokensave::acquire_branch_operation_lock(tokensave_dir).await?;
     let Some(mut meta) = branch_meta::load_branch_meta(tokensave_dir) else {
         return Ok(false);
     };
@@ -426,5 +481,32 @@ mod tests {
         assert!(!track_branch_copy(empty.path(), empty.path(), "x")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn track_branch_copy_waits_for_an_in_progress_branch_operation() {
+        use crate::branch_meta;
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        branch_meta::save_branch_meta(dir.path(), &branch_meta::BranchMeta::new("main")).unwrap();
+        std::fs::write(dir.path().join("tokensave.db"), b"DBDATA").unwrap();
+        let lock = crate::tokensave::acquire_branch_operation_lock(dir.path())
+            .await
+            .unwrap();
+
+        let mut operation = tokio::spawn({
+            let root = dir.path().to_path_buf();
+            async move { track_branch_copy(&root, &root, "feature-x").await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut operation)
+                .await
+                .is_err(),
+            "a concurrent branch copy must wait for the in-progress operation"
+        );
+
+        drop(lock);
+        assert!(operation.await.unwrap().unwrap());
     }
 }

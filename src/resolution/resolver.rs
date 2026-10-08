@@ -213,6 +213,357 @@ fn suppress_go_selector_bare_siblings(resolved: &mut Vec<ResolvedRef>) {
     });
 }
 
+/// `resolved_by` tag of a `GDScript` call resolved through its receiver's type.
+const GDSCRIPT_TYPED: &str = "gdscript-typed-receiver";
+
+/// `resolved_by` for the trailing segment of a dotted receiver call
+/// (`recv.method`), where nothing is known about the receiver.
+const SIMPLE_NAME_MATCH: &str = "simple-name-match";
+
+/// `resolved_by` for the trailing segment of a `::` path (`module::name`,
+/// `Self::name`) whose full path matched no qualified name. Kept apart from
+/// [`SIMPLE_NAME_MATCH`] (#544): a path names a declaration, while a dotted
+/// receiver may be a value of any type, so the two fallbacks are not equally
+/// trustworthy.
+const PATH_TAIL_MATCH: &str = "path-tail-match";
+
+/// `GDScript` is deliberately absent from [`lang_from_path`]: a `.gd` call into
+/// a godot-cpp method (#269) relies on the cross-language confidence that an
+/// unknown language gets, so the tag would drop those edges.
+///
+/// Case-insensitive, to agree with the SQL side, which selects `.gd` rows with
+/// `LIKE '%.gd'` (ASCII case-insensitive in `SQLite`).
+pub fn is_gdscript(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("gd"))
+}
+
+/// `resolved_by` tag of a C# call resolved through its receiver's type (#642).
+const CSHARP_TYPED: &str = "csharp-typed-receiver";
+
+/// True for a C# source path. Case-insensitive, like [`is_gdscript`].
+pub fn is_csharp(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("cs"))
+}
+
+/// True when a file's `calls` refs holding `::` are typed-receiver type
+/// expressions (`Type[::step]*::method`): `GDScript` (#597) and C# (#642).
+pub fn has_typed_receiver_refs(path: &str) -> bool {
+    is_gdscript(path) || is_csharp(path)
+}
+
+fn is_typed_receiver_tag(tag: &str) -> bool {
+    tag == GDSCRIPT_TYPED || tag == CSHARP_TYPED
+}
+
+/// A call site: caller, file, line, column, and the method's bare name.
+type CallSite<'r> = (&'r str, &'r str, u32, u32, &'r str);
+
+/// Call sites where a typed-receiver ref resolved, keyed like the sibling
+/// refs and ambiguity records they make redundant. The column is part of the
+/// key: the typed ref and its sibling share the call node's position, while a
+/// different same-named call on the same line (`given.subscribe(subscribe(1))`)
+/// does not, and must keep its own edge or ambiguity record.
+fn gdscript_typed_sites(resolved: &[ResolvedRef]) -> HashSet<CallSite<'_>> {
+    resolved
+        .iter()
+        .filter(|r| is_typed_receiver_tag(&r.resolved_by))
+        .map(|r| {
+            (
+                r.original.from_node_id.as_str(),
+                r.original.file_path.as_str(),
+                r.original.line,
+                r.original.column,
+                simple_ref_name(&r.original.reference_name),
+            )
+        })
+        .collect()
+}
+
+/// Drops the receiver-qualified sibling of a `GDScript` call whose typed ref
+/// resolved (#597).
+///
+/// The extractor records both `recv.method` and `Type::method` for a typed
+/// receiver. Once the typed one resolves, the name-based sibling can only
+/// agree with it (the same edge, collapsed by the unique index) or disagree
+/// by binding a same-named method the receiver's type does not have — for
+/// instance one in the caller's own file, which scoring favours. Either way
+/// the typed answer is the one to keep.
+fn suppress_gdscript_typed_siblings(resolved: &mut Vec<ResolvedRef>) {
+    let keep: Vec<bool> = {
+        let sites = gdscript_typed_sites(resolved);
+        if sites.is_empty() {
+            return;
+        }
+        resolved
+            .iter()
+            .map(|r| {
+                is_typed_receiver_tag(&r.resolved_by)
+                    || r.original.reference_kind != EdgeKind::Calls
+                    || !sites.contains(&(
+                        r.original.from_node_id.as_str(),
+                        r.original.file_path.as_str(),
+                        r.original.line,
+                        r.original.column,
+                        simple_ref_name(&r.original.reference_name),
+                    ))
+            })
+            .collect()
+    };
+    let mut idx = 0;
+    resolved.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+}
+
+/// The class a `GDScript` declaration names after `extends`, when it is a class
+/// name rather than a `"res://..."` path. Read from the class node's
+/// signature, which the extractor writes as `class_name X extends Y` or
+/// `class X extends Y:`.
+fn gdscript_extends(signature: &str) -> Option<&str> {
+    let (_, rest) = signature.split_once(" extends ")?;
+    let base = rest
+        .trim()
+        .split(|c: char| c.is_whitespace() || c == ':')
+        .next()?;
+    is_gdscript_ident(base).then_some(base)
+}
+
+/// The declared return type of a `GDScript` function signature
+/// (`func f(...) -> T`), when it is a class name. `void` has no members.
+fn gdscript_return_type(signature: &str) -> Option<&str> {
+    let (_, ty) = signature.rsplit_once("->")?;
+    let ty = ty.trim().trim_end_matches(':').trim();
+    (is_gdscript_ident(ty) && ty != "void").then_some(ty)
+}
+
+/// The declared type of a `GDScript` member variable signature
+/// (`[@annotation] var name: T [= v]`), when it is a class name. `:=` infers
+/// the type from the initializer, which the signature line does not type.
+fn gdscript_field_type(signature: &str) -> Option<&str> {
+    let (_, rest) = signature.split_once("var ")?;
+    let rest = rest.trim_start();
+    let after_name = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+    let after_colon = after_name.trim_start().strip_prefix(':')?;
+    if after_colon.starts_with('=') {
+        return None;
+    }
+    let after_colon = after_colon.trim_start();
+    let end = after_colon
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(after_colon.len());
+    let (ty, rest) = after_colon.split_at(end);
+    // `Array[T]` and `Outer.Inner` are not a plain class lookup.
+    let plain = !rest.starts_with('[') && !rest.starts_with('.');
+    (plain && is_gdscript_ident(ty)).then_some(ty)
+}
+
+fn is_gdscript_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether `path` is an ERB or Slim template, indexed as Ruby.
+fn is_ruby_template(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("erb") || ext.eq_ignore_ascii_case("slim"))
+}
+
+/// Whether a Ruby callable is something a view template can call bare.
+/// See `try_ruby_template_helper_match` for the rationale.
+fn is_ruby_template_helper(node: &Node) -> bool {
+    if lang_from_path(&node.file_path) != "ruby" {
+        return false;
+    }
+    match node.kind {
+        NodeKind::Function => true,
+        NodeKind::Method => {
+            if node
+                .file_path
+                .split('/')
+                .any(|segment| segment == "helpers")
+            {
+                return true;
+            }
+            // Qualified names start with the file path, sometimes twice.
+            let mut scope = node.qualified_name.as_str();
+            while let Some(rest) = scope
+                .strip_prefix(node.file_path.as_str())
+                .and_then(|rest| rest.strip_prefix("::"))
+            {
+                scope = rest;
+            }
+            let mut segments: Vec<&str> = scope.split("::").collect();
+            segments.pop();
+            segments
+                .iter()
+                .any(|s| s.ends_with("Helper") || *s == "ApplicationController")
+        }
+        _ => false,
+    }
+}
+
+/// Callable node kinds a `GDScript` method lookup accepts.
+fn is_gdscript_callable(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function | NodeKind::Method | NodeKind::Constructor
+    )
+}
+
+/// The indexed `File` node a relative JS/TS import specifier names, if any.
+fn first_indexed_candidate<'n>(
+    file_nodes: &HashMap<&str, &'n Node>,
+    importer: &str,
+    specifier: &str,
+) -> Option<&'n Node> {
+    super::js_specifier::relative_module_candidates(importer, specifier)
+        .iter()
+        .find_map(|path| file_nodes.get(path.as_str()).copied())
+}
+
+/// Callable node kinds a C# member lookup accepts.
+fn is_csharp_callable(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Function | NodeKind::Constructor
+    )
+}
+
+/// A C# type expression reduced to the class name a lookup can use: no
+/// namespace or alias qualifier, type arguments, array rank or nullability.
+/// `global::A.B.Writer<T>[]?` -> `Writer`. `None` for a tuple, pointer or
+/// anything else that is not a plain name.
+pub fn csharp_type_name(raw: &str) -> Option<&str> {
+    let s = raw.trim();
+    let s = s.strip_prefix("global::").unwrap_or(s);
+    let end = s
+        .find(|c: char| matches!(c, '<' | '[' | '(' | '?' | '*') || c.is_whitespace())
+        .unwrap_or(s.len());
+    let s = s[..end].rsplit(['.', ':']).next()?;
+    let mut chars = s.chars();
+    let ident = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_');
+    (ident && s != "var").then_some(s)
+}
+
+/// The type written before declaration `name` in a C# signature: a method's
+/// return type, a field's or property's type. The name is found at bracket
+/// depth 0, so attribute arguments and parameter lists cannot match.
+fn csharp_declared_type<'s>(signature: &'s str, name: &str) -> Option<&'s str> {
+    let bytes = signature.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'<' | b'{' => depth += 1,
+            b')' | b']' | b'>' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth != 0 || !bytes[i..].starts_with(name.as_bytes()) {
+            continue;
+        }
+        let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        let after_ok = bytes.get(i + name.len()).is_none_or(|c| {
+            matches!(c, b'(' | b'<' | b';' | b'=' | b',' | b'{') || c.is_ascii_whitespace()
+        });
+        if before_ok && after_ok {
+            return preceding_type_token(signature.get(..i)?);
+        }
+    }
+    None
+}
+
+/// The last whitespace-separated token of `s`, keeping bracketed type
+/// arguments whole (`Task<Dictionary<string, int>>`).
+fn preceding_type_token(s: &str) -> Option<&str> {
+    let s = s.trim_end();
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut start = bytes.len();
+    for (i, &c) in bytes.iter().enumerate().rev() {
+        match c {
+            b')' | b']' | b'>' => depth += 1,
+            b'(' | b'[' | b'<' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && c.is_ascii_whitespace() {
+            break;
+        }
+        start = i;
+    }
+    s.get(start..).filter(|t| !t.is_empty())
+}
+
+/// The type argument of `Task<T>` / `ValueTask<T>`, the value an `await`
+/// produces.
+fn unwrap_task(ty: &str) -> Option<&str> {
+    if !matches!(csharp_type_name(ty), Some("Task" | "ValueTask")) {
+        return None;
+    }
+    let (_, inner) = ty.split_once('<')?;
+    Some(inner.trim_end().strip_suffix('>')?.trim())
+}
+
+/// The base types named in a C# type declaration signature
+/// (`class A(int x) : Base<T>, IFoo where T : new()` -> `Base`, `IFoo`).
+fn csharp_bases(signature: &str) -> Vec<&str> {
+    let bytes = signature.as_bytes();
+    let mut depth = 0i32;
+    let mut colon = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'<' | b'{' => depth += 1,
+            b')' | b']' | b'>' | b'}' => depth -= 1,
+            b':' if bytes.get(i + 1) == Some(&b':') => i += 1,
+            b':' if depth == 0 => {
+                colon = Some(i);
+                break;
+            }
+            b'w' if depth == 0
+                && bytes[i..].starts_with(b"where")
+                && i > 0
+                && bytes[i - 1].is_ascii_whitespace() =>
+            {
+                return Vec::new();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(colon) = colon else {
+        return Vec::new();
+    };
+    let rest = signature.get(colon + 1..).unwrap_or("");
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let rb = rest.as_bytes();
+    for (j, &c) in rb.iter().enumerate() {
+        match c {
+            b'(' | b'[' | b'<' => depth += 1,
+            b')' | b']' | b'>' => depth -= 1,
+            _ => {}
+        }
+        let at_where =
+            depth == 0 && rb[j..].starts_with(b"where") && j > 0 && rb[j - 1].is_ascii_whitespace();
+        if depth == 0 && (c == b',' || at_where) {
+            out.extend(rest.get(start..j).and_then(csharp_type_name));
+            start = j + 1;
+            if at_where {
+                return out;
+            }
+        }
+    }
+    out.extend(rest.get(start..).and_then(csharp_type_name));
+    out
+}
+
 /// Infer a coarse language tag from a file path extension.
 fn lang_from_path(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -227,7 +578,7 @@ fn lang_from_path(path: &str) -> &'static str {
         "c" | "h" => "c",
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "inl" | "ipp" | "tcc" => "cpp",
         "cs" => "csharp",
-        "rb" => "ruby",
+        "rb" | "rake" | "erb" | "slim" => "ruby",
         "php" => "php",
         "scala" | "sc" => "scala",
         "dart" => "dart",
@@ -235,8 +586,11 @@ fn lang_from_path(path: &str) -> &'static str {
         "pl" | "pm" => "perl",
         "sh" | "bash" => "bash",
         "nix" => "nix",
+        "tf" | "tfvars" => "terraform",
         "zig" => "zig",
         "proto" => "proto",
+        "vhd" | "vhdl" => "vhdl",
+        "v" | "vh" | "sv" | "svh" => "systemverilog",
         _ => "unknown",
     }
 }
@@ -337,6 +691,9 @@ pub struct ReferenceResolver<'a> {
     /// the qualifier refers to, so same-named packages don't collide (#149
     /// Bug 1).
     go_import_qualifiers: HashMap<String, HashMap<String, String>>,
+    /// `File` nodes keyed by their path, for binding a relative JS/TS import
+    /// specifier to the file it names (#647).
+    file_nodes: HashMap<&'a str, &'a Node>,
 }
 
 /// References paired with their position in the slice `resolve_all` was given,
@@ -351,9 +708,13 @@ impl<'a> ReferenceResolver<'a> {
         let mut node_id_cache: HashMap<&'a str, &'a Node> = HashMap::new();
         let mut ruby_constant_bindings: HashMap<&'a str, Vec<&'a Node>> = HashMap::new();
         let mut suffix_cache: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+        let mut file_nodes: HashMap<&'a str, &'a Node> = HashMap::new();
 
         for node in all_nodes {
             node_id_cache.insert(node.id.as_str(), node);
+            if node.kind == NodeKind::File {
+                file_nodes.insert(node.file_path.as_str(), node);
+            }
             // Skip Use nodes — they represent import statements, not definitions.
             // Including them causes false cross-file edges when two files share
             // the same `use std::path::Path` import.
@@ -416,6 +777,18 @@ impl<'a> ReferenceResolver<'a> {
                         .or_default()
                         .insert(imported.to_string());
                 }
+                // A relative JS/TS import names a file, not a symbol. Record
+                // the file it resolves to (by its path, which cannot collide
+                // with an identifier) so the reachability gate sees that the
+                // importer can reach that file's exports (#647).
+                if let Some(target) =
+                    first_indexed_candidate(&file_nodes, &node.file_path, &node.name)
+                {
+                    import_index
+                        .entry(node.file_path.clone())
+                        .or_default()
+                        .insert(target.file_path.clone());
+                }
             }
         }
 
@@ -456,6 +829,7 @@ impl<'a> ReferenceResolver<'a> {
             known_names,
             import_index,
             go_import_qualifiers,
+            file_nodes,
         }
     }
 
@@ -499,6 +873,47 @@ impl<'a> ReferenceResolver<'a> {
             }
         }
 
+        // A relative JS/TS import specifier names a file. Bind it to that
+        // file's `File` node, applying TypeScript's `.js` -> `.ts` mapping, or
+        // to nothing: its trailing dotted segment (`js` in `./hash.js`) is not
+        // a symbol name, so the name-based strategies below can only produce a
+        // phantom edge (#647).
+        if uref.reference_kind == EdgeKind::Uses
+            && super::js_specifier::is_js_family_importer(&uref.file_path)
+            && super::js_specifier::is_relative_specifier(&uref.reference_name)
+        {
+            return first_indexed_candidate(
+                &self.file_nodes,
+                &uref.file_path,
+                &uref.reference_name,
+            )
+            .map(|target| ResolvedRef {
+                original: uref.clone(),
+                target_node_id: target.id.clone(),
+                confidence: 0.95,
+                resolved_by: ResolvedBy::RelativeImport.as_str().to_string(),
+            });
+        }
+
+        // GDScript typed-receiver calls (#597) carry the receiver's static
+        // type, so they resolve through that class or not at all. The
+        // receiver-qualified `recv.method` ref the extractor records at the
+        // same site keeps today's name-based behaviour for everything else.
+        if uref.reference_kind == EdgeKind::Calls
+            && is_gdscript(&uref.file_path)
+            && uref.reference_name.contains("::")
+        {
+            return self.try_gdscript_typed_match(uref);
+        }
+
+        // C# typed-receiver calls (#642), same contract as GDScript's.
+        if uref.reference_kind == EdgeKind::Calls
+            && is_csharp(&uref.file_path)
+            && uref.reference_name.contains("::")
+        {
+            return self.try_csharp_typed_match(uref);
+        }
+
         // Ruby receiver-qualified calls use only positive receiver and
         // singleton-definition evidence. Unsupported or ambiguous shapes stay
         // unresolved instead of falling back to the trailing method name.
@@ -507,6 +922,16 @@ impl<'a> ReferenceResolver<'a> {
             && (uref.reference_name.contains('.') || uref.reference_name.contains("::"))
         {
             return self.try_ruby_receiver_match(uref);
+        }
+
+        // Terraform `Uses` references are canonical declaration addresses, not
+        // receiver calls. Preserve the whole dotted name so `var.region` cannot
+        // fall back to an unrelated `region` attribute.
+        if uref.reference_kind == EdgeKind::Uses
+            && lang_from_path(&uref.file_path) == "terraform"
+            && uref.reference_name.contains('.')
+        {
+            return self.try_exact_name_match(uref);
         }
 
         // Strategy 1: qualified name match (`::`-separated paths, e.g. Rust's
@@ -521,7 +946,9 @@ impl<'a> ReferenceResolver<'a> {
                 .rsplit("::")
                 .next()
                 .unwrap_or(&uref.reference_name);
-            if let Some(resolved) = self.try_exact_name_match_simple(uref, simple_name) {
+            if let Some(resolved) =
+                self.try_exact_name_match_simple(uref, simple_name, false, PATH_TAIL_MATCH)
+            {
                 return Some(resolved);
             }
             return None;
@@ -550,21 +977,86 @@ impl<'a> ReferenceResolver<'a> {
                 .rsplit('.')
                 .next()
                 .unwrap_or(&uref.reference_name);
+            // Only a call has a receiver; a dotted base type or type reference
+            // (`App.Data.IProducer`) is a namespace path and may name a type in
+            // the referrer's own scope (#643).
+            if simple_name != uref.reference_name
+                && uref.reference_kind == EdgeKind::Calls
+                && is_csharp(&uref.file_path)
+            {
+                return self.try_csharp_receiver_fallback(uref, simple_name);
+            }
             if simple_name != uref.reference_name {
-                if let Some(resolved) = self.try_exact_name_match_simple(uref, simple_name) {
+                if let Some(resolved) =
+                    self.try_exact_name_match_simple(uref, simple_name, true, SIMPLE_NAME_MATCH)
+                {
                     return Some(resolved);
                 }
             }
             return None;
         }
 
+        // A bare name in an ERB/Slim template binds to view helpers only.
+        if uref.reference_kind == EdgeKind::Calls && is_ruby_template(&uref.file_path) {
+            return self.try_ruby_template_helper_match(uref);
+        }
+
         // Strategy 2: exact name match
         self.try_exact_name_match(uref)
+    }
+
+    /// Resolves a bare call in an ERB or Slim template.
+    ///
+    /// A template's bare names are mostly not calls the template source can
+    /// prove: partial locals (`render "row", item: x` makes `item` a local the
+    /// partial never binds), controller-assigned variables and the view
+    /// context's own methods. Matching them by name alone binds a partial's
+    /// `item` to whatever `def item` the project happens to have. A view
+    /// calls helpers, so only helper-shaped targets are candidates: a method
+    /// in a `helpers/` directory (Rails' `app/helpers`, engines included), a
+    /// method of a `*Helper` module, a method of `ApplicationController`
+    /// (where `helper_method` exposures conventionally live), a top-level
+    /// `def` (a private method of `Object`, callable everywhere), or a method
+    /// defined in the template itself.
+    fn try_ruby_template_helper_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
+        let blocklisted = CROSS_FILE_BLOCKLIST.contains(&uref.reference_name.as_str());
+        let candidates: Vec<&Node> = self
+            .name_cache
+            .get(uref.reference_name.as_str())?
+            .iter()
+            .copied()
+            .filter(|n| kind_compatible(uref, &n.kind))
+            .filter(|n| {
+                if n.file_path == uref.file_path {
+                    return true;
+                }
+                !blocklisted && is_ruby_template_helper(n)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        resolve_from_filtered_named(
+            uref,
+            &candidates,
+            "ruby-template-helper",
+            &self.import_index,
+            false,
+            &self.node_id_cache,
+        )
     }
 
     /// Returns true if a reference name could plausibly resolve to a known symbol.
     fn is_known_name(&self, name: &str) -> bool {
         self.known_names.contains(name)
+    }
+
+    /// Whether `uref` is a relative JS/TS import whose specifier names an
+    /// indexed file. Such a ref is never a known *name* (#647).
+    fn is_relative_import(&self, uref: &UnresolvedRef) -> bool {
+        uref.reference_kind == EdgeKind::Uses
+            && first_indexed_candidate(&self.file_nodes, &uref.file_path, &uref.reference_name)
+                .is_some()
     }
 
     /// Every key the name pre-filter admits, for the equivalence test that
@@ -580,7 +1072,8 @@ impl<'a> ReferenceResolver<'a> {
     /// turning hopeless lookups into O(1) hash checks.
     pub fn resolve_all(&self, refs: &[UnresolvedRef]) -> ResolutionResult {
         let total = refs.len();
-        let (mut resolved, ambiguous, unresolved) = self.resolve_batch_inner(refs);
+        let (mut resolved, mut ambiguous, unresolved) = self.resolve_batch_inner(refs);
+        self.finalize_ambiguous(&resolved, &mut ambiguous);
         self.finalize_resolved(&mut resolved);
         let resolved_count = resolved.len();
         ResolutionResult {
@@ -619,6 +1112,30 @@ impl<'a> ReferenceResolver<'a> {
     /// the accumulated set.
     pub fn finalize_resolved(&self, resolved: &mut Vec<ResolvedRef>) {
         suppress_go_selector_bare_siblings(resolved);
+        suppress_gdscript_typed_siblings(resolved);
+    }
+
+    /// The ambiguity half of [`Self::finalize_resolved`], run once over the
+    /// accumulated results for the same reason.
+    ///
+    /// A `GDScript` call whose typed ref resolved is not ambiguous, even though
+    /// its receiver-qualified sibling tied on the bare method name (#597).
+    /// Left in, the record would list the losing same-named methods as
+    /// candidates, and `dead_code` treats an ambiguity candidate as referenced.
+    pub fn finalize_ambiguous(&self, resolved: &[ResolvedRef], ambiguous: &mut Vec<AmbiguousCall>) {
+        let sites = gdscript_typed_sites(resolved);
+        if sites.is_empty() {
+            return;
+        }
+        ambiguous.retain(|a| {
+            !sites.contains(&(
+                a.from_node_id.as_str(),
+                a.file_path.as_str(),
+                a.line,
+                a.column,
+                simple_ref_name(&a.reference_name),
+            ))
+        });
     }
 
     /// Resolve `refs`, returning the resolved edges, the ambiguity records, and
@@ -648,6 +1165,7 @@ impl<'a> ReferenceResolver<'a> {
             refs.iter().enumerate().partition(|(_, uref)| {
                 self.is_known_name(&uref.reference_name)
                     || self.is_known_name(simple_ref_name(&uref.reference_name))
+                    || self.is_relative_import(uref)
             });
 
         let results: Vec<_> = candidates
@@ -688,21 +1206,67 @@ impl<'a> ReferenceResolver<'a> {
     }
 
     /// Converts a slice of resolved references into graph edges.
+    ///
+    /// Duplicates (same source, target, kind and line) collapse to the one
+    /// with the strongest provenance, which is the row the unique edge index
+    /// then keeps (#544).
     pub fn create_edges(&self, resolved: &[ResolvedRef]) -> Vec<Edge> {
-        resolved
+        let mut edges: Vec<Edge> = resolved
             .iter()
             .map(|r| Edge {
                 source: r.original.from_node_id.clone(),
                 target: r.target_node_id.clone(),
-                kind: r.original.reference_kind,
+                kind: self.edge_kind_for(r),
                 line: Some(r.original.line),
+                resolved_by: ResolvedBy::from_name(&r.resolved_by),
             })
-            .collect()
+            .collect();
+        edges.sort_unstable_by(|a, b| {
+            (
+                &a.source,
+                &a.target,
+                a.kind.as_str(),
+                &a.line,
+                a.provenance_key(),
+            )
+                .cmp(&(
+                    &b.source,
+                    &b.target,
+                    b.kind.as_str(),
+                    &b.line,
+                    b.provenance_key(),
+                ))
+        });
+        edges.dedup_by(|a, b| {
+            a.source == b.source && a.target == b.target && a.kind == b.kind && a.line == b.line
+        });
+        edges
     }
 
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
+
+    /// The edge kind to store for a resolved reference.
+    ///
+    /// A C# base list (`class A : X, IY`) cannot syntactically distinguish a
+    /// base class from an interface, so the extractor records a class's
+    /// first base as `Extends`. Once the target is known, an `Extends` that
+    /// lands on an interface is really an `Implements`, which is what
+    /// `tokensave_implementations` reads (#643).
+    fn edge_kind_for(&self, r: &ResolvedRef) -> EdgeKind {
+        let kind = r.original.reference_kind;
+        if kind == EdgeKind::Extends
+            && lang_from_path(&r.original.file_path) == "csharp"
+            && self
+                .node_id_cache
+                .get(r.target_node_id.as_str())
+                .is_some_and(|n| n.kind == NodeKind::Interface)
+        {
+            return EdgeKind::Implements;
+        }
+        kind
+    }
 
     /// Strategy 1: try matching the reference name against qualified names.
     fn try_qualified_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
@@ -851,6 +1415,285 @@ impl<'a> ReferenceResolver<'a> {
         })
     }
 
+    /// Resolve a `GDScript` typed-receiver call `Type[::step]*::method` (#597).
+    ///
+    /// The extractor writes the receiver's static type as a class name plus
+    /// the member steps it went through: `field` reads a member variable's
+    /// declared type, `method()` a method's declared return type. Each is
+    /// evaluated here against the indexed classes — `class_name` makes every
+    /// script class global, so a class is found by name alone — and a member
+    /// missing from a class is looked up through its `extends` chain.
+    ///
+    /// Returns `None` whenever the evidence runs out: an engine or unindexed
+    /// class, an untyped step, a method the class does not have. The
+    /// receiver-qualified sibling ref then decides, as it did before.
+    fn try_gdscript_typed_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
+        let mut segments = uref.reference_name.split("::");
+        let root = segments.next()?;
+        let mut steps: Vec<&str> = segments.collect();
+        let method = steps.pop()?;
+
+        let mut class = self.gdscript_class(root)?;
+        for step in steps {
+            let ty = if let Some(name) = step.strip_suffix("()") {
+                let callee = self.gdscript_member(class, name, is_gdscript_callable)?;
+                gdscript_return_type(callee.signature.as_deref()?)?
+            } else {
+                let field = self.gdscript_member(class, step, |k| *k == NodeKind::Field)?;
+                gdscript_field_type(field.signature.as_deref()?)?
+            };
+            class = self.gdscript_class(ty)?;
+        }
+
+        let target = self.gdscript_member(class, method, is_gdscript_callable)?;
+        Some(ResolvedRef {
+            original: uref.clone(),
+            target_node_id: target.id.clone(),
+            confidence: 0.95,
+            resolved_by: GDSCRIPT_TYPED.to_string(),
+        })
+    }
+
+    /// The one `GDScript` class named `name`: a `class_name` script class, or
+    /// failing that an inner class. Several of either is no evidence.
+    fn gdscript_class(&self, name: &str) -> Option<&'a Node> {
+        let candidates = self.name_cache.get(name)?;
+        let unique = |kind: NodeKind| {
+            let mut it = candidates
+                .iter()
+                .copied()
+                .filter(|n| n.kind == kind && is_gdscript(&n.file_path));
+            let first = it.next()?;
+            it.next().is_none().then_some(first)
+        };
+        unique(NodeKind::Class).or_else(|| unique(NodeKind::InnerClass))
+    }
+
+    /// The member `name` of `class`, declared there or inherited through its
+    /// `extends` chain.
+    fn gdscript_member(
+        &self,
+        class: &'a Node,
+        name: &str,
+        kind_ok: impl Fn(&NodeKind) -> bool,
+    ) -> Option<&'a Node> {
+        // Bounded so an `extends` cycle (which Godot rejects, but an index of
+        // a broken tree can hold) cannot loop.
+        const MAX_DEPTH: usize = 32;
+        let mut class = class;
+        for _ in 0..MAX_DEPTH {
+            let qn = format!("{}.{name}", class.qualified_name);
+            if let Some(found) = self
+                .qualified_name_cache
+                .get(qn.as_str())
+                .and_then(|nodes| nodes.iter().copied().find(|n| kind_ok(&n.kind)))
+            {
+                return Some(found);
+            }
+            let base = gdscript_extends(class.signature.as_deref()?)?;
+            class = self.gdscript_class(base)?;
+        }
+        None
+    }
+
+    /// Resolve a C# typed-receiver call `Type[::step]*::Method` (#642).
+    ///
+    /// Steps are `member` (a field's or property's declared type), `Method()`
+    /// (a method's declared return type) and `await Method()` (the same,
+    /// unwrapping `Task<T>`/`ValueTask<T>`), each read from the declaration's
+    /// signature. A member missing from a type is looked up through its base
+    /// list. Several same-named types (partial classes, or one name in two
+    /// namespaces) are all searched; distinct targets are scored and a tie is
+    /// no answer.
+    ///
+    /// Returns `None` whenever the evidence runs out (an unindexed type, an
+    /// extension method, an ambiguous step); the receiver-qualified sibling
+    /// ref then decides.
+    fn try_csharp_typed_match(&self, uref: &UnresolvedRef) -> Option<ResolvedRef> {
+        let mut segments = uref.reference_name.split("::");
+        let root = segments.next()?;
+        let mut steps: Vec<&str> = segments.collect();
+        let method = steps.pop()?;
+
+        let mut types = self.csharp_types(root);
+        for step in steps {
+            let (awaited, step) = match step.strip_prefix("await ") {
+                Some(s) => (true, s),
+                None => (false, step),
+            };
+            let members = match step.strip_suffix("()") {
+                Some(name) => self.csharp_members(&types, name, is_csharp_callable),
+                None => self.csharp_members(&types, step, |k| {
+                    matches!(k, NodeKind::Field | NodeKind::CSharpProperty)
+                }),
+            };
+            let mut next: Vec<&str> = members
+                .iter()
+                .filter_map(|m| {
+                    let raw = csharp_declared_type(m.signature.as_deref()?, &m.name)?;
+                    let raw = if awaited { unwrap_task(raw)? } else { raw };
+                    csharp_type_name(raw)
+                })
+                .collect();
+            next.sort_unstable();
+            next.dedup();
+            let [ty] = next.as_slice() else {
+                return None;
+            };
+            types = self.csharp_types(ty);
+        }
+
+        let mut targets = self.csharp_members(&types, method, is_csharp_callable);
+        // Overloads share a qualified name; the first declared stands for them.
+        targets.sort_by(|a, b| {
+            (a.qualified_name.as_str(), a.start_line)
+                .cmp(&(b.qualified_name.as_str(), b.start_line))
+        });
+        targets.dedup_by(|a, b| a.qualified_name == b.qualified_name);
+        let (target_node_id, confidence) = match targets.as_slice() {
+            [] => return None,
+            [one] => (one.id.clone(), 0.95),
+            many => {
+                let winners = Self::find_best_matches(uref, many, &self.import_index);
+                let [best] = winners.as_slice() else {
+                    return None;
+                };
+                (best.id.clone(), 0.9)
+            }
+        };
+        Some(ResolvedRef {
+            original: uref.clone(),
+            target_node_id,
+            confidence,
+            resolved_by: CSHARP_TYPED.to_string(),
+        })
+    }
+
+    /// Every indexed C# type declaration named `name`.
+    fn csharp_types(&self, name: &str) -> Vec<&'a Node> {
+        self.name_cache
+            .get(name)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .copied()
+                    .filter(|n| {
+                        matches!(
+                            n.kind,
+                            NodeKind::Class
+                                | NodeKind::InnerClass
+                                | NodeKind::Struct
+                                | NodeKind::Interface
+                                | NodeKind::Record
+                        ) && is_csharp(&n.file_path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The members named `name` of `types`, declared there or, failing that,
+    /// in the nearest base types that declare one.
+    fn csharp_members(
+        &self,
+        types: &[&'a Node],
+        name: &str,
+        kind_ok: impl Fn(&NodeKind) -> bool,
+    ) -> Vec<&'a Node> {
+        // Bounded so a base-list cycle in a broken tree cannot loop.
+        const MAX_DEPTH: usize = 16;
+        let mut seen: HashSet<&str> = types.iter().map(|t| t.id.as_str()).collect();
+        let mut frontier: Vec<&'a Node> = types.to_vec();
+        for _ in 0..MAX_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let found: Vec<&'a Node> = frontier
+                .iter()
+                .filter_map(|t| {
+                    self.qualified_name_cache
+                        .get(format!("{}::{name}", t.qualified_name).as_str())
+                })
+                .flat_map(|nodes| nodes.iter().copied().filter(|n| kind_ok(&n.kind)))
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+            let mut next = Vec::new();
+            for t in &frontier {
+                for base in csharp_bases(t.signature.as_deref().unwrap_or("")) {
+                    for b in self.csharp_types(base) {
+                        if seen.insert(b.id.as_str()) {
+                            next.push(b);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Vec::new()
+    }
+
+    /// The name-based fallback for a C# receiver-qualified call `recv.Method`.
+    ///
+    /// A receiver that is not `this`/`base` is some other object, so the
+    /// caller's own class is no evidence for the target: the same-file bonus
+    /// would otherwise bind `refresher.RefreshAsync()` inside
+    /// `Coordinator.PollAndRefreshAsync` to `Coordinator.RefreshAsync` (#642,
+    /// the C# form of #503). Members of the caller's own type are dropped
+    /// from the candidates before the usual scoring.
+    fn try_csharp_receiver_fallback(
+        &self,
+        uref: &UnresolvedRef,
+        simple_name: &str,
+    ) -> Option<ResolvedRef> {
+        let receiver = uref
+            .reference_name
+            .rsplit_once('.')
+            .map_or("", |(recv, _)| recv);
+        let own_scope = self
+            .node_id_cache
+            .get(uref.from_node_id.as_str())
+            .and_then(|caller| caller.qualified_name.rsplit_once("::"))
+            .map(|(scope, _)| scope);
+        let Some(own_scope) = own_scope.filter(|_| !matches!(receiver, "this" | "base")) else {
+            return self.try_exact_name_match_simple(uref, simple_name, true, SIMPLE_NAME_MATCH);
+        };
+        let in_own_scope = |n: &Node| {
+            n.qualified_name
+                .rsplit_once("::")
+                .is_some_and(|(scope, _)| scope == own_scope)
+        };
+        let compatible: Vec<&Node> = self
+            .name_cache
+            .get(simple_name)?
+            .iter()
+            .copied()
+            .filter(|n| kind_compatible(uref, &n.kind))
+            .collect();
+        if !compatible.iter().any(|n| in_own_scope(n)) {
+            return self.try_exact_name_match_simple(uref, simple_name, true, SIMPLE_NAME_MATCH);
+        }
+        if CROSS_FILE_BLOCKLIST.contains(&simple_name) {
+            return None;
+        }
+        let others: Vec<&Node> = compatible
+            .into_iter()
+            .filter(|n| !in_own_scope(n))
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+        resolve_from_filtered_named(
+            uref,
+            &others,
+            SIMPLE_NAME_MATCH,
+            &self.import_index,
+            true,
+            &self.node_id_cache,
+        )
+    }
+
     fn ruby_constant_owners_at(&self, constant_path: &str) -> Option<Vec<&Node>> {
         let bindings = self.ruby_constant_bindings.get(constant_path)?;
         bindings
@@ -945,11 +1788,32 @@ impl<'a> ReferenceResolver<'a> {
             // Cache the filtered subset in a local Vec so the downstream
             // helpers see the same shape. Allocating here only on the
             // shrunk path keeps the happy path zero-copy.
-            return resolve_from_filtered(uref, &kind_filtered, &self.import_index);
+            return resolve_from_filtered(
+                uref,
+                &kind_filtered,
+                &self.import_index,
+                &self.node_id_cache,
+            );
         };
 
         if candidates.len() == 1 {
             let ref_lang = lang_from_path(&uref.file_path);
+            // Being the only candidate is not evidence. #508 taught the
+            // dotted-receiver path this; the bare-name path never learned it,
+            // so a production function declaring a local `exe` acquired an edge
+            // to a pytest fixture named `exe` purely because the fixture was
+            // the only symbol of that name in the project (#522). Scoped by
+            // language: see `bare_name_needs_evidence`.
+            if bare_name_needs_evidence(ref_lang)
+                && !is_plausibly_reachable(
+                    uref,
+                    candidates[0],
+                    &self.import_index,
+                    &self.node_id_cache,
+                )
+            {
+                return None;
+            }
             let candidate_lang = lang_from_path(&candidates[0].file_path);
             let confidence = if ref_lang != "unknown"
                 && candidate_lang != "unknown"
@@ -978,7 +1842,7 @@ impl<'a> ReferenceResolver<'a> {
             original: uref.clone(),
             target_node_id: best.id.clone(),
             confidence: 0.7,
-            resolved_by: "exact-match".to_string(),
+            resolved_by: "exact-match-scored".to_string(),
         })
     }
 
@@ -986,6 +1850,8 @@ impl<'a> ReferenceResolver<'a> {
         &self,
         uref: &UnresolvedRef,
         simple_name: &str,
+        require_reachable: bool,
+        tag: &str,
     ) -> Option<ResolvedRef> {
         if CROSS_FILE_BLOCKLIST.contains(&simple_name) {
             let candidates = self.name_cache.get(simple_name)?;
@@ -1023,12 +1889,24 @@ impl<'a> ReferenceResolver<'a> {
             return resolve_from_filtered_named(
                 uref,
                 &kind_filtered,
-                "simple-name-match",
+                tag,
                 &self.import_index,
+                require_reachable,
+                &self.node_id_cache,
             );
         };
 
         if candidates.len() == 1 {
+            if require_reachable
+                && !is_plausibly_reachable(
+                    uref,
+                    candidates[0],
+                    &self.import_index,
+                    &self.node_id_cache,
+                )
+            {
+                return None;
+            }
             let ref_lang = lang_from_path(&uref.file_path);
             let candidate_lang = lang_from_path(&candidates[0].file_path);
             let confidence = if ref_lang != "unknown"
@@ -1043,7 +1921,7 @@ impl<'a> ReferenceResolver<'a> {
                 original: uref.clone(),
                 target_node_id: candidates[0].id.clone(),
                 confidence,
-                resolved_by: "simple-name-match".to_string(),
+                resolved_by: tag.to_string(),
             });
         }
 
@@ -1056,7 +1934,7 @@ impl<'a> ReferenceResolver<'a> {
             original: uref.clone(),
             target_node_id: best.id.clone(),
             confidence: 0.7,
-            resolved_by: "simple-name-match".to_string(),
+            resolved_by: format!("{tag}-scored"),
         })
     }
 
@@ -1155,12 +2033,23 @@ impl<'a> ReferenceResolver<'a> {
         if uref.reference_kind != EdgeKind::Calls {
             return None;
         }
+        // A GDScript typed ref that did not resolve is not a name tie: its
+        // receiver-qualified sibling at the same site explains any tie (#597).
+        if has_typed_receiver_refs(&uref.file_path) && uref.reference_name.contains("::") {
+            return None;
+        }
         let simple_name = simple_ref_name(&uref.reference_name);
         let raw = self.name_cache.get(simple_name)?;
+        // A template's bare call only ever competes among helpers; a tie
+        // among unrelated same-named methods is not an ambiguity it has.
+        let template_bare = is_ruby_template(&uref.file_path) && simple_name == uref.reference_name;
         let candidates: Vec<&Node> = raw
             .iter()
             .copied()
             .filter(|n| kind_compatible(uref, &n.kind))
+            .filter(|n| {
+                !template_bare || n.file_path == uref.file_path || is_ruby_template_helper(n)
+            })
             .collect();
 
         let winners = Self::find_best_matches(uref, &candidates, &self.import_index);
@@ -1173,6 +2062,7 @@ impl<'a> ReferenceResolver<'a> {
             reference_name: uref.reference_name.clone(),
             file_path: uref.file_path.clone(),
             line: uref.line,
+            column: uref.column,
             // `find_best_matches` already orders by id, so the record is
             // stable across runs.
             candidate_node_ids: winners.into_iter().map(|n| n.id).collect(),
@@ -1251,6 +2141,17 @@ fn kind_compatible(uref: &UnresolvedRef, target_kind: &NodeKind) -> bool {
         EdgeKind::Implements if lang_from_path(&uref.file_path) == "ruby" => {
             matches!(target_kind, NodeKind::Module)
         }
+        // A VHDL architecture implements an entity, and an entity is indexed
+        // as a `Module` because an instantiation targets it (#344).
+        EdgeKind::Implements if lang_from_path(&uref.file_path) == "vhdl" => {
+            matches!(target_kind, NodeKind::Module)
+        }
+        // A VHDL `use` clause names a package. The package body is indexed as
+        // an `Impl` with the same name; left permissive, `Uses` would tie
+        // between the two and resolve to neither.
+        EdgeKind::Uses if lang_from_path(&uref.file_path) == "vhdl" => {
+            matches!(target_kind, NodeKind::Package)
+        }
         EdgeKind::Implements | EdgeKind::Extends | EdgeKind::DerivesMacro => {
             matches!(
                 target_kind,
@@ -1311,12 +2212,132 @@ fn kind_compatible(uref: &UnresolvedRef, target_kind: &NodeKind) -> bool {
 /// candidate list to a strict subset of `name_cache`. Mirrors the
 /// single-candidate / multi-candidate branches of
 /// `try_exact_name_match` but operates on the borrowed slice.
-fn resolve_from_filtered(
+fn resolve_from_filtered<'a>(
     uref: &UnresolvedRef,
     kind_filtered: &[&Node],
     import_index: &HashMap<String, HashSet<String>>,
+    node_by_id: &HashMap<&'a str, &'a Node>,
 ) -> Option<ResolvedRef> {
-    resolve_from_filtered_named(uref, kind_filtered, "exact-match", import_index)
+    resolve_from_filtered_named(
+        uref,
+        kind_filtered,
+        "exact-match",
+        import_index,
+        false,
+        node_by_id,
+    )
+}
+
+/// Whether a lone candidate is plausibly visible from the call site.
+///
+/// This governs the dotted-receiver fallback only — `recv.method()` in a
+/// dynamically typed language, where the receiver's type is not tracked and
+/// the resolver has nothing to go on but the method name. Being the only
+/// symbol in the project with that name is *not* evidence of a match: nothing
+/// checked that the call site can reach it (#503, the #378 defect in Python).
+///
+/// The failure is quiet and it has a direction. Test doubles are deliberately
+/// named after the API they stand in for, so a fake logger defines `info` and
+/// a faithful fake of a UI toolkit defines `after`, `delete` and `grid` —
+/// exactly the names production code calls on untracked receivers. Production
+/// code then binds to the test tree, and every consumer of `calls` inherits
+/// it: `circular` reports one strongly-connected component spanning production
+/// and tests, `dead_code` sees a phantom caller and calls live code reachable,
+/// `impact` and `file_dependents` report modules as depending on test files.
+///
+/// Evidence means one of: the candidate is in the caller's own file; it sits
+/// in the same directory, which is one package in every language this path
+/// serves; the caller imports its name; or the caller imports the module it
+/// lives in. Anything else declines, and a declined reference is simply
+/// unresolved — a missing edge degrades an answer, a fabricated one corrupts
+/// it.
+/// Languages where a bare name alone is not evidence of a binding.
+///
+/// The reachability gate was built for the dotted-receiver fallback in
+/// dynamically typed languages, and its evidence model — same file, same
+/// directory, an imported name, an imported module — describes how those
+/// languages are written. A blanket rule is measurably wrong: Rust and Go
+/// resolve a bare name through a module system the gate cannot see, so
+/// gating them declines calls the code plainly makes — **11.4% of every Rust
+/// call edge** on a 1,824-file tree, against no reduction in impossible
+/// edges, because Rust never had this problem (#522).
+///
+/// **Ruby is deliberately absent.** It looks like it belongs, and it does not:
+/// it has its own resolution paths here (`try_ruby_receiver_match`, the
+/// constant-binding table), and gating its bare names drops a legitimate
+/// `Implements` edge for a module included from another file — caught by
+/// `test_ruby_incremental_sync_graph_matches_full_reindex`. Anything added to
+/// this list needs the same before/after measurement Python got, not an
+/// argument from resemblance.
+fn bare_name_needs_evidence(lang: &str) -> bool {
+    matches!(lang, "python" | "javascript" | "typescript")
+}
+
+fn is_plausibly_reachable(
+    uref: &UnresolvedRef,
+    candidate: &Node,
+    import_index: &HashMap<String, HashSet<String>>,
+    node_by_id: &HashMap<&str, &Node>,
+) -> bool {
+    if candidate.file_path == uref.file_path {
+        return true;
+    }
+
+    let dir_of = |path: &str| path.rfind('/').map(|i| path[..i].to_string());
+    if dir_of(&candidate.file_path) == dir_of(&uref.file_path) {
+        return true;
+    }
+
+    let Some(imports) = import_index.get(&uref.file_path) else {
+        return false;
+    };
+
+    // A relative JS/TS import of the candidate's file, recorded by path when
+    // the index was built (#647).
+    if imports.contains(&candidate.file_path) {
+        return true;
+    }
+
+    // The index keys each import on the last `::` segment, which for a Python
+    // or JS import is the whole dotted path — `headroom.perf.analyzer` is one
+    // key, not three. So an entry matches when it equals the name outright or
+    // ends with it as a dotted segment; without the second reading, `import
+    // headroom.perf.analyzer` is not recognised as importing `analyzer` and
+    // the guard declines calls the file plainly can make.
+    let imported = |name: &str| {
+        imports
+            .iter()
+            .any(|entry| entry == name || entry.rsplit('.').next() == Some(name))
+    };
+
+    if imported(&candidate.name) {
+        return true;
+    }
+
+    // The class that owns the method is the evidence a method call actually
+    // needs: `from pkg.encoder import Encoder` then `self.enc.encode(x)`
+    // imports `Encoder`, never `encode`. Without this the guard would decline
+    // most legitimate method calls in the languages it governs — measured at
+    // 13% of all call edges on a 992-file Python project, which is far too
+    // much recall to trade for the phantoms.
+    if let Some(parent) = candidate
+        .parent_id
+        .as_deref()
+        .and_then(|id| node_by_id.get(id))
+    {
+        if imported(&parent.name) {
+            return true;
+        }
+    }
+
+    // The module the candidate lives in: `pkg/logging.py` is imported as
+    // `logging`, and the import index keys on that last segment.
+    let module = candidate
+        .file_path
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.split('.').next());
+    module.is_some_and(imported)
 }
 
 fn resolve_from_filtered_named(
@@ -1324,8 +2345,15 @@ fn resolve_from_filtered_named(
     kind_filtered: &[&Node],
     resolved_by: &str,
     import_index: &HashMap<String, HashSet<String>>,
+    require_reachable: bool,
+    node_by_id: &HashMap<&str, &Node>,
 ) -> Option<ResolvedRef> {
     if kind_filtered.len() == 1 {
+        if require_reachable
+            && !is_plausibly_reachable(uref, kind_filtered[0], import_index, node_by_id)
+        {
+            return None;
+        }
         return Some(ResolvedRef {
             original: uref.clone(),
             target_node_id: kind_filtered[0].id.clone(),
@@ -1348,6 +2376,6 @@ fn resolve_from_filtered_named(
         original: uref.clone(),
         target_node_id: best.id.clone(),
         confidence: 0.65,
-        resolved_by: resolved_by.to_string(),
+        resolved_by: format!("{resolved_by}-scored"),
     })
 }

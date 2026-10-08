@@ -80,6 +80,13 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 })?,
             };
 
+            // Serialize the copy + metadata phase with the asynchronous
+            // post-checkout hook and transparent auto-track paths. The lock
+            // is deliberately released before the branch's sync below, so
+            // `TokenSave::open` can perform its normal auto-track check.
+            let _branch_lock =
+                tokensave::tokensave::acquire_branch_operation_lock(&tokensave_dir).await?;
+
             // Load or bootstrap metadata
             let mut meta = branch_meta::load_branch_meta(&tokensave_dir).unwrap_or_else(|| {
                 let default = branch::detect_default_branch(&project_path)
@@ -117,9 +124,32 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
             // Save metadata BEFORE open() so it resolves the new branch to its DB
             meta.add_branch(&branch_name, &db_file, &parent);
             branch_meta::save_branch_meta(&tokensave_dir, &meta)?;
+            drop(_branch_lock);
+
+            // A sync reads the working directory, so it can only speak for the
+            // branch that is actually checked out. Adding some *other* branch
+            // used to call `TokenSave::open`, which resolves the DB for HEAD:
+            // the new branch's DB stayed a bare copy of the parent while the
+            // working tree — including files that exist on no branch at all —
+            // was written into the *current* branch's DB (#501). When the
+            // target is not checked out, the copy of the parent is the honest
+            // answer, and the `post-checkout` hook refreshes it on arrival.
+            let checked_out = branch::current_branch(&project_path);
+            if checked_out.as_deref() != Some(branch_name.as_str()) {
+                spinner.done(&format!(
+                    "branch '{branch_name}' tracked — copied from '{parent}'"
+                ));
+                eprintln!(
+                    "Not checked out, so nothing was indexed from the working tree. \
+                     Check it out and run `tokensave sync` to bring it up to date."
+                );
+                return Ok(());
+            }
 
             // Run incremental sync (hash-based delta) against the new branch DB
             spinner.set_message("syncing changes");
+            // Safe now: the guard above established that HEAD is this branch,
+            // so `open` resolves to the DB just registered for it.
             let cg = TokenSave::open(&project_path).await?;
             let result = cg.sync().await?;
 
@@ -211,21 +241,28 @@ pub(crate) async fn handle_branch_action(action: BranchAction) -> tokensave::err
                 return Ok(());
             };
 
+            // Ask git which branches exist rather than probing for
+            // `.git/refs/heads/<name>` on disk (#501). That probe finds
+            // nothing inside a linked worktree, where `.git` is a file, and
+            // nothing in a `reftable` repository, which keeps no loose refs —
+            // so every tracked branch looked stale and its live DB was
+            // deleted. Refuse to delete anything when the refs cannot be
+            // read: not knowing is not the same as knowing they are gone.
+            let Some(live) = branch::local_branches(&project_path) else {
+                return Err(tokensave::errors::TokenSaveError::Config {
+                    message: format!(
+                        "cannot list branches in '{}' — refusing to delete any branch DB",
+                        project_path.display()
+                    ),
+                });
+            };
+
             // Find branches in metadata that no longer exist in git
             let stale: Vec<String> = meta
                 .branches
                 .keys()
                 .filter(|name| *name != &meta.default_branch)
-                .filter(|name| {
-                    let ref_path = project_path.join(format!(".git/refs/heads/{name}"));
-                    let packed = project_path.join(".git/packed-refs");
-                    let suffix = format!("refs/heads/{name}");
-                    let in_packed = packed.exists()
-                        && std::fs::read_to_string(&packed)
-                            .map(|c| c.lines().any(|line| line.ends_with(&suffix)))
-                            .unwrap_or(false);
-                    !ref_path.exists() && !in_packed
-                })
+                .filter(|name| !live.contains(name.as_str()))
                 .cloned()
                 .collect();
 
@@ -524,7 +561,7 @@ pub(crate) async fn init_and_index(
         "init_and_index: project_path must be absolute"
     );
     let mut cg = if TokenSave::is_initialized(project_path) {
-        TokenSave::open(project_path).await?
+        TokenSave::open_rebuilding_failed_migration(project_path).await?
     } else {
         let cg = TokenSave::init(project_path).await?;
         eprintln!("Initialized TokenSave at {}", project_path.display());
@@ -738,6 +775,7 @@ pub async fn handle_discover(since: &str, json_output: bool) -> tokensave::error
                     "tool": b.bucket.tool_name(),
                     "suggestion": b.bucket.suggestion(),
                     "turns": b.turns,
+                    "turns_with_measured_sizes": b.turns_with_measured_sizes,
                     "addressable_input_tokens": b.addressable_input_tokens,
                     "recoverable_input_tokens": b.recoverable_input_tokens(),
                 })
@@ -748,6 +786,7 @@ pub async fn handle_discover(since: &str, json_output: bool) -> tokensave::error
             "recoverable_fraction": discover::RECOVERABLE_FRACTION,
             "total_turns": report.total_turns,
             "replaceable_turns": report.total_replaceable_turns(),
+            "turns_with_measured_sizes": report.total_turns_with_measured_sizes(),
             "total_addressable_input_tokens": report.total_addressable_input_tokens(),
             "total_recoverable_input_tokens": report.total_recoverable_input_tokens(),
             "buckets": buckets,
@@ -792,6 +831,32 @@ pub async fn handle_discover(since: &str, json_output: bool) -> tokensave::error
         tokensave::display::format_token_count(report.total_recoverable_input_tokens()),
         discover::RECOVERABLE_FRACTION * 100.0,
     );
+
+    // Turns ingested before #474 carry no tool-result size, so a range reaching
+    // back before the upgrade reports navigation turns worth zero tokens. Say
+    // why, or the honest "nothing measured here yet" reads as the very bug
+    // #474 reported — a figure that is implausibly small.
+    //
+    // Which turns carry a size is a fact to read, not to infer from the total
+    // being zero: that inference called a genuinely-measured zero "unknown",
+    // and said nothing at all about a range straddling the upgrade, where the
+    // total is a real but partial figure (#523).
+    let replaceable = report.total_replaceable_turns();
+    let measured = report.total_turns_with_measured_sizes();
+    if replaceable > 0 && measured == 0 {
+        println!(
+            "  These turns were recorded before tool-result sizes were measured, so \
+             their addressable total is unknown rather than zero. Turns ingested from \
+             now on carry it."
+        );
+    } else if measured < replaceable {
+        println!(
+            "  {} of {replaceable} of these turns were recorded before tool-result sizes \
+             were measured, so the addressable total above counts the other {measured} \
+             and is a lower bound.",
+            replaceable - measured
+        );
+    }
 
     Ok(())
 }
@@ -966,4 +1031,74 @@ mod skipped_summary_tests {
             "got: {headline}"
         );
     }
+}
+
+/// Handles a git `post-checkout` event (#342 Q1).
+///
+/// This is the branching that used to live inline in the installed hook
+/// script. Moving it into the binary means the hook file itself is one
+/// delegating line that never has to be rewritten again: every later change to
+/// what a checkout triggers ships with the binary. It is also testable here,
+/// which it was not as shell.
+///
+/// The semantics are carried over unchanged:
+///
+/// * git reports the initial checkout of a fresh clone — and of every new
+///   `git worktree add` — by passing the all-zeros sentinel as the previous
+///   HEAD. That checkout is **also** a branch checkout and can land on a
+///   branch that is not the default one (`git clone -b feature`,
+///   `git worktree add -b feature`), so it runs `init` and **then** tracks the
+///   branch. Sequentially, because tracking copies the index `init` creates.
+/// * Any other branch checkout (`branch_flag == "1"`) tracks the
+///   just-checked-out branch alone.
+/// * File checkouts (`branch_flag == "0"`) trigger nothing.
+///
+/// Tracking always goes through the `auto_track` gate (#397), so the knob
+/// stays authoritative on this path. Silent by design and never fails the
+/// checkout: a hook runs on every branch switch and must neither narrate nor
+/// be able to break `git checkout`.
+pub async fn hook_post_checkout(prev_head: Option<&str>, branch_flag: Option<&str>) {
+    use tokensave::agents::hooks::{classify_checkout, is_under_temp_dir, CheckoutAction};
+
+    let project_path = tokensave::config::resolve_path(None);
+
+    // #569: under a `Global` hook install, this also fires inside ephemeral
+    // clones unrelated tools (CocoaPods, npm, ...) stage in the system temp
+    // dir and expect to own exclusively. Canonicalize both sides first: on
+    // macOS `/tmp` is a symlink to `/private/tmp`, and comparing the
+    // un-resolved forms would never match.
+    let system_temp = std::env::temp_dir();
+    let system_temp = std::fs::canonicalize(&system_temp).unwrap_or(system_temp);
+    let canonical_project_path =
+        std::fs::canonicalize(&project_path).unwrap_or_else(|_| project_path.clone());
+    if is_under_temp_dir(&canonical_project_path, &system_temp) {
+        return;
+    }
+
+    match classify_checkout(prev_head, branch_flag) {
+        CheckoutAction::InitThenTrack => {
+            // `init` on an already-initialised project returns an error;
+            // either way tracking still runs, matching the shell's
+            // `init || exit 0` followed by the track.
+            let _ = init_and_index(&project_path, &[], false).await;
+            track_current_branch_if_enabled(&project_path).await;
+        }
+        CheckoutAction::TrackOnly => track_current_branch_if_enabled(&project_path).await,
+        CheckoutAction::Nothing => {}
+    }
+}
+
+/// Tracks the current branch when `auto_track` allows it, swallowing every
+/// failure. Shared by both arms of [`hook_post_checkout`].
+async fn track_current_branch_if_enabled(project_path: &std::path::Path) {
+    let config = tokensave::config::load_config(project_path).unwrap_or_default();
+    if !tokensave::config::env_bool_override("TOKENSAVE_AUTO_TRACK", config.auto_track) {
+        return;
+    }
+    let _ = handle_branch_action(BranchAction::Add {
+        name: None,
+        path: Some(project_path.display().to_string()),
+        if_enabled: true,
+    })
+    .await;
 }

@@ -103,9 +103,13 @@ scoop bucket add tokensave https://github.com/aovestdipaperino/scoop-bucket
 scoop install tokensave
 ```
 
-**Cargo (any platform):**
+**Cargo / cargo-binstall (any platform):**
 
 ```bash
+# Fast install prebuilt binary without compiling:
+cargo binstall tokensave
+
+# Or compile from source:
 cargo install tokensave                          # full (50+ languages, default)
 cargo install tokensave --features medium        # medium tier
 cargo install tokensave --no-default-features    # lite (smallest binary)
@@ -158,6 +162,14 @@ Each agent gets its MCP server registered in the native config format. Claude Co
 Global OMP installs target the profile reported by bare `omp config path`, writing `<resolved-agent-dir>/mcp.json` and `<resolved-agent-dir>/rules/tokensave.md`. Export `OMP_PROFILE` or OMP's compatible `PI_PROFILE` when installing into a named profile; OMP's resolver also honors `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR`. Tokensave trusts that native resolver rather than duplicating OMP's profile logic. Tokensave installs MCP and advisory rules for OMP; it does not install OMP hook enforcement.
 
 All changes are idempotent -- safe to run again after upgrading. After agent setup, you'll be offered global git post-commit and post-checkout hooks. `tokensave uninstall` removes those hooks along with the agent integrations; pass `--keep-git-hooks` to leave them, or manage them on their own with `tokensave githooks`.
+
+### Install for several agents at once
+
+Repeat `--agent` to install several agents in a single run. The permission grant, git-hook offer, and global config write each happen once, no matter how many agents you list:
+
+```bash
+tokensave install --agent claude --agent cursor --agent droid
+```
 
 ### Project-local install
 
@@ -416,7 +428,7 @@ Different from the criterion bench above: criterion measures per-iteration laten
 
 ## 80+ MCP Tools
 
-The server exposes more than 80 tools (one fewer when the optional `ast-grep` binary is not on `PATH`); the tables below group the most commonly used ones by category. Most are read-only, safe to call in parallel, and annotated with `readOnlyHint`. The edit primitives are scoped to single files and re-index in place; session baseline and memory-recording tools also mutate local `.tokensave` state and are annotated as non-read-only. The three core tools (`tokensave_context`, `tokensave_search`, `tokensave_status`) are marked `anthropic/alwaysLoad` so they bypass the client's tool-search round-trip.
+The server exposes more than 80 tools (one fewer when the optional `ast-grep` binary is not on `PATH`). Since 7.14.0 only the 11 core tools plus `tokensave_more` are listed by default; the rest are listed on demand through `tokensave_more`, stay callable by name, and are all listed with `"tools": "full"`. The tables below group the most commonly used ones by category. Most are read-only, safe to call in parallel, and annotated with `readOnlyHint`. The edit primitives are scoped to single files and re-index in place; session baseline and memory-recording tools also mutate local `.tokensave` state and are annotated as non-read-only. The three core tools (`tokensave_context`, `tokensave_search`, `tokensave_status`) are marked `anthropic/alwaysLoad` so they bypass the client's tool-search round-trip.
 
 ### Query another initialized project
 
@@ -483,9 +495,9 @@ ignoring it.
 
 `tokensave_files` covers more than source. Files whose extension is listed in
 `artifact_extensions` (`.feature`, `.json`, `.yaml`, `.yml`, `.sql`, `.toml`,
-`.proto`, `.graphql`, `.md` by default) are tracked by path so questions like
-"where are the `.feature` files for the login flow?" have a graph answer rather
-than a blocked `find` (#323). They are never parsed and contribute no symbols;
+`.proto`, `.graphql`, `.md`, `.bnd`, `.bndrun` by default) are tracked by path
+so questions like "where are the `.feature` files for the login flow?" have a
+graph answer rather than a blocked `find` (#323). They are never parsed and contribute no symbols;
 `kind: "artifact"` and `kind: "code"` filter between the two, and analyses that
 mean "code" exclude them. An extension already handled by a language extractor
 is ignored in this list, so it cannot be used to stop a language being parsed.
@@ -493,8 +505,8 @@ is ignored in this list, so it cannot be used to stop a language being parsed.
 The list also decides what **literal search can look inside** (#442). A literal
 (`literal: true`) search over `tokensave_search` reads bytes rather than
 symbols, so it needs no parser -- but it iterates the indexed files, so it can
-only reach a file the index holds a row for. A tracked `.html` template or
-`.css` stylesheet has neither an extractor nor a default artifact entry, so its
+only reach a file the index holds a row for. A tracked `.rst` document or
+`.tmpl` template has neither an extractor nor a default artifact entry, so its
 matches are missing; add the extension here and run `tokensave sync -f` and its
 lines are searched like any other, reported with `enclosing: null` since there
 is no symbol context. A literal response that could not reach every tracked
@@ -509,7 +521,7 @@ partial answer is never presented as a complete one.
 | `tokensave_callees` | Find what a function calls |
 | `tokensave_impact` | See what's affected by changing a symbol |
 | `tokensave_affected` | Find test files affected by source changes |
-| `tokensave_rename_preview` | All references to a symbol (preview rename impact) |
+| `tokensave_rename` | Graph-based rename: every site with a confidence class (`exact`, `heuristic`, `ambiguous`, `text_only`), a diff preview, and an all-or-nothing apply. Not binding-aware |
 | `tokensave_hotspots` | Most connected symbols (highest call count) |
 
 ### Code Quality
@@ -612,6 +624,10 @@ Four resources are exposed via `resources/list` and `resources/read`:
 tokensave measures the tokens it saves on every MCP tool call. Each tool response includes a `tokensave_metrics: before=N after=M` line showing how many raw-file tokens were avoided by that specific call.
 
 **Turning the reporting off.** The metrics line, together with a sentence in the MCP `instructions`, asks the agent to report savings to you — which means the model spends *output* tokens narrating a saving tokensave made on *input* tokens. Output tokens are the more expensive kind, so if your agent mentions tokensave on nearly every turn, that narration can offset the win (#356). Set `report_savings` to `false` in `.tokensave/config.json`, or the `TOKENSAVE_REPORT_SAVINGS` environment variable to override it per-run (any value enables it except `0`, `false`, `no`, `off`, or empty). Both the metrics line and the instruction disappear; `tokensave install` likewise stops writing the reporting rule into agent prompt files. Measurement is untouched either way — every call still lands in the savings ledger, so `tokensave gain`, `tokensave list`, `status` and `monitor` keep reporting exactly as before. The default stays `true`.
+
+**Only the core tools are listed by default.** An MCP client sends the schema of every listed tool on every turn, before any tool is called. The full tokensave surface is about 89 KB of schema, which on a small-context model can be more than half of the window (#576). So `tools/list` sends only the core tools: `context`, `search`, `status`, `read`, `body`, `files`, `callers`, `callees`, `impact`, `str_replace` and `multi_str_replace` (about 17 KB with `tokensave_more`). The `initialize` instructions name these tools and the areas `tokensave_more` can list, so a client that defers tool schemas still knows the rest exist. The setting selects what the server lists, not what it can run: a tool that is not listed still answers a call by name, so agent permission lists and hooks keep working. To list every tool, set `"tools": "full"` in `.tokensave/config.json`, or `TOKENSAVE_TOOLS=full` in the environment of the MCP server; the environment variable wins over the file. A `"tools": "full"` written by 7.13.0, which wrote it into every config it saved, is read as the old default; set it again after upgrading to keep the full list.
+
+With the core toolset the server also lists `tokensave_more`. A call with an `area` (`analysis`, `edit`, `git`, `memory`, `navigate` or `all`) lists the tools of that area for the rest of the session, and the server sends `notifications/tools/list_changed` so the client fetches the list again. A session pays only for the areas it uses: the `git` area adds about 6 KB. A client that ignores `list_changed` keeps the core list. `tokensave install` grants `tokensave_more` along with every other tool, so it does not prompt; an install from before this release prompts once, until `tokensave reinstall` or the upgrade resync refreshes the permission list.
 
 ### Cost observability
 
@@ -863,12 +879,16 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | Dart | `.dart` | `lang-dart` |
 | Pascal | `.pas`, `.pp`, `.dpr` | `lang-pascal` |
 | PHP | `.php` | `lang-php` |
-| Ruby | `.rb` | `lang-ruby` |
+| Ruby (including ERB and Slim templates) | `.rb`, `.rake`, `.erb`, `.slim` | `lang-ruby` |
 | Bash | `.sh`, `.bash` | `lang-bash` |
 | Protobuf | `.proto` | `lang-protobuf` |
 | PowerShell | `.ps1`, `.psm1` | `lang-powershell` |
 | Nix | `.nix` | `lang-nix` |
 | VB.NET | `.vb` | `lang-vbnet` |
+
+ERB and Slim templates use the Ruby grammar without requiring Ruby or template gems at indexing time. Template calls belong to the file node and retain their original line and byte column. ERB supports code/output tags, trim markers, comments, and escaped tags. Slim supports control/output lines, indentation-based blocks, attributes (including multiline attribute lists), text interpolation, and `ruby:` blocks.
+
+Custom Slim shortcuts and embedded-language compilation are not supported. Locals supplied by Rails at render time cannot be distinguished from bare helper calls; names assigned or bound in the template are excluded conservatively. Controller-to-view and partial-render relationships require separate Rails semantic wiring.
 
 ### Full (Medium + everything else) -- default
 
@@ -893,6 +913,7 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | WGSL | `.wgsl` | `lang-wgsl` |
 | HLSL | `.hlsl`, `.fx` | `lang-hlsl` |
 | Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh` | `lang-systemverilog` |
+| VHDL | `.vhd`, `.vhdl` | `lang-vhdl` |
 | Metal | `.metal` | `lang-metal` |
 | CUDA / HIP | `.cu`, `.cuh` | `lang-cuda` |
 | Markdown | `.md`, `.markdown` | `lang-markdown` |
@@ -907,8 +928,11 @@ Always compiled. The smallest binary for the most popular languages, plus Svelte
 | F# | `.fs`, `.fsi`, `.fsx` | `lang-fsharp` |
 | F* | `.fst`, `.fsti` | `lang-fstar` |
 | Quint | `.qnt` | `lang-quint` |
+| Terraform | `.tf`, `.tfvars` | `lang-terraform` |
 | TOML | `.toml` | `lang-toml` |
 | Lean | `.lean` | `lang-lean` |
+| HTML | `.html`, `.htm` | `lang-html` |
+| CSS | `.css` | `lang-css` |
 
 Individual languages can also be cherry-picked without a full tier:
 
@@ -917,6 +941,8 @@ cargo install tokensave --no-default-features --features lang-nix,lang-bash
 ```
 
 All extractors share the same depth: functions, classes, methods, fields, imports, call graphs, inheritance chains, docstrings, complexity metrics, decorator/annotation extraction, and cross-file dependency tracking.
+
+HTML and CSS are the exception, because neither language has callable symbols. HTML records elements carrying an `id`, custom elements, and the stylesheets and scripts a page pulls in; CSS records class and id selectors, custom properties, `@keyframes` names, and `@import`s. Neither resolves a `class="..."` attribute to a stylesheet rule: class names are ordinary words, and matching them by bare name across a whole project invents edges rather than finding them.
 
 ---
 
@@ -953,11 +979,22 @@ tokensave is a ground-up Rust rewrite of [CodeGraph](https://www.npmjs.com/packa
 | **Self-upgrade** | `tokensave upgrade` with stable/beta channels | `npm update` |
 | **DB engine** | libsql (SQLite fork, WAL, async) | better-sqlite3 / wa-sqlite (WASM) |
 | **Indexing speed** | ~1.2s for 1,782 files | ~4s for 1,782 files |
-| **Binary size** | ~25 MB (all grammars bundled) | ~80 MB (node_modules + WASM) |
+| **Binary size** | ~25 MB compressed download (all grammars bundled) | ~80 MB (node_modules + WASM) |
 
 CodeGraph pioneered the approach and remains a solid choice if you prefer npm tooling and only need Claude Code integration. tokensave extends the concept with deeper analysis, more agents, multi-branch support, and a native binary with no runtime dependencies.
 
 For detailed comparisons against CodeGraph, Dual-Graph (GrapeRoot), code-review-graph, and OpenWolf, see [docs/COMPARABLE-TOOLS.md](docs/COMPARABLE-TOOLS.md).
+
+**Side-by-side comparison pages** (each one states where the other tool is better):
+[Serena](https://tokensave.dev/vs-serena) ·
+[code-review-graph](https://tokensave.dev/vs-code-review-graph) ·
+[Graphify](https://tokensave.dev/vs-graphify) ·
+[CodeGraph](https://tokensave.dev/vs-codegraph) ·
+[token-savior](https://tokensave.dev/vs-token-savior) ·
+[GrapeRoot](https://tokensave.dev/vs-graperoot) ·
+[LeanCTX](https://tokensave.dev/vs-leanctx) ·
+[OpenWolf](https://tokensave.dev/vs-openwolf) —
+index at [tokensave.dev/vs](https://tokensave.dev/vs).
 
 ---
 
@@ -967,11 +1004,11 @@ Several tools reduce token usage for AI coding agents. Here's why tokensave stan
 
 ### Single native binary, zero dependencies
 
-Every alternative requires a runtime: Python, Node.js, or both. tokensave ships as a single ~25 MB Rust binary with all 50+ tree-sitter grammars bundled. Nothing else to install.
+Most alternatives require a runtime: Python, Node.js, or both. tokensave ships as a single Rust binary with all 50+ tree-sitter grammars bundled (~25 MB compressed download). Nothing else to install -- and unlike LSP-backed tools such as [Serena](https://tokensave.dev/vs-serena), no language server to install, start or warm up per language. Two tools now match tokensave on packaging: [CodeGraph](https://tokensave.dev/vs-codegraph) bundles its own runtime, and [LeanCTX](https://tokensave.dev/vs-leanctx) is also a single Rust binary.
 
 ### Deepest code intelligence
 
-tokensave works at the symbol level: functions, structs, fields, call edges, type hierarchies, complexity metrics. Alternatives like Dual-Graph (GrapeRoot) work at the file level -- they know which files exist but can't answer "who calls this function?" or "what breaks if I change this struct?" tokensave's 80+ specialized MCP tools cover call graph traversal, impact analysis, dead code detection, test mapping, rename preview, type hierarchies, circular dependency detection, complexity ranking, code-health analytics (Gini, DSM, dependency depth, risk-weighted test gaps), atomic edit primitives, and more. The closest competitor (code-review-graph) has 22 tools; others have 5-9.
+tokensave works at the symbol level: functions, structs, fields, call edges, type hierarchies, complexity metrics. Alternatives like Dual-Graph (GrapeRoot) work at the file level -- they know which files exist but can't answer "who calls this function?" or "what breaks if I change this struct?" tokensave's 80+ specialized MCP tools cover call graph traversal, impact analysis, dead code detection, test mapping, rename preview, type hierarchies, circular dependency detection, complexity ranking, code-health analytics (Gini, DSM, dependency depth, risk-weighted test gaps), atomic edit primitives, and more. The closest comparable graph tool, [code-review-graph](https://tokensave.dev/vs-code-review-graph), exposes 30; several others expose fewer than 10 by deliberate design.
 
 ### Broadest agent support
 
@@ -1069,14 +1106,17 @@ This project is a Rust port of the original [CodeGraph](https://github.com/colby
 ## Building
 
 ```bash
-cargo build --release                          # full (50+ languages, default)
-cargo build --release --features medium        # medium tier
-cargo build --release --no-default-features    # lite (smallest binary)
+cargo build --locked --release                          # full (50+ languages, default)
+cargo build --locked --release --features medium        # medium tier
+cargo build --locked --release --no-default-features    # lite (smallest binary)
 
-cargo test                                     # run all tests (requires full)
-cargo check --no-default-features              # verify lite compiles
-cargo clippy --all
+cargo test --workspace --locked                         # run all tests (requires full)
+cargo check --locked --no-default-features              # verify lite compiles
+cargo clippy --workspace --all-targets --locked
 ```
+
+Development commands use debug builds; installation uses optimized release output
+only (`cargo install --path . --locked`). `target/debug` is never an installation input.
 
 ## Star History
 

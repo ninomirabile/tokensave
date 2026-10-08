@@ -10,6 +10,7 @@ fn env_indexed() -> HookEnv {
         in_tokensave_project: true,
         disable_grep_hook: false,
         project_root: None,
+        cwd: None,
     }
 }
 
@@ -18,6 +19,7 @@ fn env_not_indexed() -> HookEnv {
         in_tokensave_project: false,
         disable_grep_hook: false,
         project_root: None,
+        cwd: None,
     }
 }
 
@@ -26,6 +28,7 @@ fn env_disabled() -> HookEnv {
         in_tokensave_project: true,
         disable_grep_hook: true,
         project_root: None,
+        cwd: None,
     }
 }
 
@@ -44,6 +47,7 @@ fn env_rooted_at(root: &Path) -> HookEnv {
         in_tokensave_project: true,
         disable_grep_hook: false,
         project_root: Some(root.to_path_buf()),
+        cwd: None,
     }
 }
 
@@ -335,7 +339,7 @@ fn test_kiro_allows_invalid_json() {
 
 // ============================================================================
 // Grep tool redirect — symbol-shaped patterns against code files should
-// redirect to tokensave_search / _signature_search / _callers.
+// redirect to tokensave_search (by name, or literal for call sites).
 // ============================================================================
 
 #[test]
@@ -608,12 +612,25 @@ fn test_bash_blocks_rtk_grep_prefix() {
 }
 
 #[test]
-fn test_bash_allows_git_grep() {
-    let input = r#"{"command": "git grep -n FooBar"}"#;
+fn test_bash_allows_git_grep_of_a_revision() {
+    // A revision makes git grep a search of history, which the index does not
+    // hold. Without a revision it searches the working tree and is redirected
+    // like any other grep (#648, see `hook_648_test.rs`).
+    let input = r#"{"command": "git grep -n FooBar HEAD~3"}"#;
     let result = evaluate_hook_decision_with_env(input, &env_indexed());
     assert!(
         result.is_empty(),
-        "git grep searches history — pass through"
+        "git grep of a revision searches history — pass through"
+    );
+}
+
+#[test]
+fn test_bash_redirects_git_grep_of_the_working_tree() {
+    let input = r#"{"command": "git grep -n FooBar"}"#;
+    let result = evaluate_hook_decision_with_env(input, &env_indexed());
+    assert!(
+        is_blocked(&result),
+        "git grep of the working tree is a code search"
     );
 }
 
@@ -1066,11 +1083,11 @@ fn test_droid_allows_terminal_launched_tools() {
 }
 
 #[test]
-fn test_droid_allows_git_grep() {
-    // git grep searches history, which tokensave does not index.
+fn test_droid_allows_git_grep_of_a_revision() {
+    // git grep of a revision searches history, which tokensave does not index.
     let input = r#"{
         "tool_name": "Execute",
-        "tool_input": {"command": "git grep FooBar"}
+        "tool_input": {"command": "git grep FooBar HEAD~1"}
     }"#;
     assert!(evaluate_droid_pre_tool_use_with_env(input, &env_indexed()).is_none());
 }
@@ -1443,6 +1460,7 @@ fn test_bash_absolute_project_root_respects_opt_out() {
         in_tokensave_project: true,
         disable_grep_hook: true,
         project_root: Some(root.clone()),
+        cwd: None,
     };
     assert!(
         evaluate_hook_decision_with_env(&input, &disabled).is_empty(),
@@ -1617,6 +1635,7 @@ fn test_droid_event_cwd_still_honors_the_opt_out() {
         in_tokensave_project: false,
         disable_grep_hook: true,
         project_root: None,
+        cwd: None,
     };
     assert!(
         evaluate_droid_pre_tool_use_with_env(&input, &disabled_outside).is_none(),
@@ -1948,5 +1967,74 @@ fn test_bash_allows_grep_after_chained_cd_uses_first_directory() {
     assert!(
         result.is_empty(),
         "only the first leading cd is modeled; a second cd must not override it: {result}"
+    );
+}
+
+/// A project directory whose name is not in `CODE_DIRS`, so the verdict can
+/// only come from resolving the path, never from the basename fallback.
+fn indexed_project_with_code_dir(dir: &str) -> (tempfile::TempDir, PathBuf) {
+    let (tmp, root) = indexed_project();
+    std::fs::create_dir_all(root.join(dir)).expect("create code dir");
+    std::fs::write(root.join(dir).join("lib.rs"), b"fn handle_request() {}").expect("write source");
+    (tmp, root)
+}
+
+#[test]
+fn test_relative_target_resolves_against_the_event_cwd() {
+    let (_tmp, root) = indexed_project_with_code_dir("mypkg");
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "cwd": root.to_string_lossy(),
+        "tool_input": {"command": "grep -rn handle_request mypkg/"},
+    })
+    .to_string();
+    // The hook process itself sits outside any project, which is how a harness
+    // spawns it: the event's `cwd` is the only thing that can resolve `mypkg/`.
+    let result = evaluate_claude_pre_tool_use_with_env(&input, &env_not_indexed());
+    assert!(
+        is_blocked(&result),
+        "a relative target must resolve against the event cwd, not the hook process cwd: {result}"
+    );
+}
+
+#[test]
+fn test_relative_target_resolves_against_a_subdirectory_event_cwd() {
+    let (_tmp, root) = indexed_project();
+    let nested = root.join("crate_a");
+    std::fs::create_dir_all(nested.join("mypkg")).expect("create nested code dir");
+    std::fs::write(
+        nested.join("mypkg").join("lib.rs"),
+        b"fn handle_request() {}",
+    )
+    .expect("write source");
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "cwd": nested.to_string_lossy(),
+        "tool_input": {"command": "grep -rn handle_request mypkg/"},
+    })
+    .to_string();
+    let result = evaluate_claude_pre_tool_use_with_env(&input, &env_not_indexed());
+    assert!(
+        is_blocked(&result),
+        "a session in a subdirectory spells its targets relative to that subdirectory: {result}"
+    );
+}
+
+#[test]
+fn test_relative_target_climbing_out_of_the_project_is_left_alone() {
+    let (tmp, root) = indexed_project_with_code_dir("mypkg");
+    let sibling = tmp.path().join("other");
+    std::fs::create_dir_all(&sibling).expect("create sibling");
+    std::fs::write(sibling.join("lib.rs"), b"fn handle_request() {}").expect("write source");
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "cwd": root.to_string_lossy(),
+        "tool_input": {"command": "grep -rn handle_request ../other/"},
+    })
+    .to_string();
+    let result = evaluate_claude_pre_tool_use_with_env(&input, &env_not_indexed());
+    assert!(
+        result.is_empty(),
+        "a target outside the indexed tree is not this guardrail's concern: {result}"
     );
 }

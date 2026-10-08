@@ -341,7 +341,10 @@ fn test_language_registry_finds_scala_extractor() {
 #[test]
 fn test_language_registry_returns_none_for_unknown() {
     let registry = LanguageRegistry::new();
-    assert!(registry.extractor_for_file("style.css").is_none());
+    // `.css` used to stand here as the example of an unhandled extension; it
+    // gained an extractor in #507, so the case is now an extension nothing
+    // claims.
+    assert!(registry.extractor_for_file("archive.tar.gz").is_none());
     assert!(registry.extractor_for_file("README.unknown").is_none());
 }
 
@@ -360,6 +363,18 @@ fn test_language_registry_supported_extensions() {
     assert!(exts.contains(&"cjs"));
     assert!(exts.contains(&"mts"));
     assert!(exts.contains(&"cts"));
+    #[cfg(feature = "lang-terraform")]
+    {
+        // #495: Terraform/OpenTofu configurations and variable assignments.
+        assert!(exts.contains(&"tf"));
+        assert!(exts.contains(&"tfvars"));
+        assert_eq!(
+            registry
+                .extractor_for_language("Terraform")
+                .map(|extractor| extractor.language_name()),
+            Some("Terraform")
+        );
+    }
     // #262: Minecraft datapack functions.
     #[cfg(feature = "lang-mcfunction")]
     assert!(exts.contains(&"mcfunction"));

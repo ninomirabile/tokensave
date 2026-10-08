@@ -28,6 +28,25 @@ pub(crate) struct Spinner {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Keeps the tail of a spinner message short enough not to wrap a typical
+/// 80-column terminal.
+///
+/// The cut is by bytes, so it can land inside a multi-byte character: a
+/// Hangul or CJK path used to panic this inside the spinner thread, which
+/// froze the progress line for the rest of the run while indexing carried on
+/// and exited 0 — indistinguishable from a hang on a large project (#527).
+/// Walking forward to the next boundary trims at most two more bytes.
+fn spinner_tail(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= 50 {
+        return text.into();
+    }
+    let mut start = text.len() - 49;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..]).into()
+}
+
 impl Spinner {
     pub(crate) fn new() -> Self {
         let message = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -46,11 +65,7 @@ impl Spinner {
                     let frame = frames[idx % frames.len()];
                     idx += 1;
                     // Truncate to avoid line wrapping on typical terminals.
-                    let display: std::borrow::Cow<str> = if text.len() > 50 {
-                        format!("…{}", &text[text.len() - 49..]).into()
-                    } else {
-                        text.as_str().into()
-                    };
+                    let display = spinner_tail(&text);
                     let mut stderr = std::io::stderr();
                     let _ = write!(stderr, "\r\x1b[2K{} {}", frame, display);
                     let _ = stderr.flush();
@@ -170,7 +185,11 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
         tokensave::extraction_worker::run_worker();
     }
 
-    let skip_agent_install_maintenance = should_skip_agent_install_maintenance(&command);
+    let skip_agent_install_maintenance = agent_maintenance_disabled_from_env(
+        std::env::var("TOKENSAVE_SKIP_AGENT_MAINTENANCE")
+            .ok()
+            .as_deref(),
+    ) || should_skip_agent_install_maintenance(&command);
 
     // First-run notice (check BEFORE any config save creates the file)
     let is_first_run = tokensave::user_config::UserConfig::is_fresh();
@@ -253,6 +272,36 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     };
                     ag.install(&ctx).is_ok()
                 });
+            if outcome.changed {
+                // #624: an upgrade also brings tokensave's section of hooks
+                // that are already installed up to this binary's shape, global
+                // and this repository's own, so a user who never runs
+                // `reinstall` is not left on the old one. Nothing is
+                // installed; only sections tokensave already wrote change.
+                // Every write names itself (#419), since the user did not ask
+                // for it.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                report_hook_refresh(&tokensave::agents::refresh_installed_git_hooks(
+                    &cwd,
+                    &current_bin_path(),
+                ));
+
+                // Refresh a tokensave-owned Claude rules file that exists on
+                // disk even when `claude` is not in `installed_agents` (#553).
+                // A user may register tokensave per project (`.mcp.json`) or
+                // remove the user-scope entry, so the agent is absent from the
+                // list while `~/.claude/rules/tokensave.md` is still
+                // tokensave's own file. Rewriting just that file is inside the
+                // contract; the full install would re-add an MCP entry the
+                // user deliberately removed. Idempotent: no-op when unchanged.
+                let claude_rules =
+                    tokensave::agents::integrations::claude::claude_managed_rules_path(&home);
+                if claude_rules.exists() {
+                    if let Ok(body) = tokensave::agents::rules_for_agent("claude") {
+                        let _ = tokensave::agents::write_managed_rules_file(&claude_rules, &body);
+                    }
+                }
+            }
             tokensave::agents::set_quiet_install(false);
             if outcome.ran {
                 // Say what this was and why (#419). The user did not ask for an
@@ -716,36 +765,59 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             let mut installed_names: Vec<String> = Vec::new();
             let mut removed_names: Vec<String> = Vec::new();
 
-            if let Some(id) = agent {
-                let ag = tokensave::agents::get_integration(&id)?;
-                let name = ag.name().to_string();
-                if local && !ag.supports_local() {
-                    return Err(tokensave::errors::TokenSaveError::Config {
-                        message: format!(
-                            "--local is not supported for \"{}\" — it has no project-scoped config. \
-                             Run a global install instead (omit --local).",
-                            ag.id()
-                        ),
-                    });
-                }
-                let ctx = tokensave::agents::InstallContext {
-                    home: home.clone(),
-                    tokensave_bin: tokensave_bin.clone(),
-                    tool_permissions: tokensave::agents::install_tool_perms(want_wildcard),
-                    scope: scope.clone(),
-                    force_permission_style,
-                };
-                ag.install(&ctx)?;
-                // A --local install is project-scoped; it must not touch the
-                // global installed-agents registry (which `reinstall` replays
-                // as global installs) or persist global user config.
-                if local {
-                    installed_names.push(name);
-                } else {
-                    if !user_cfg.installed_agents.contains(&id) {
-                        user_cfg.installed_agents.push(id);
-                        installed_names.push(name);
+            if !agent.is_empty() {
+                // Repeat `--agent` in a single run installs every named agent
+                // in turn (#640), in the order the user typed them. A repeated
+                // id (`--agent foo --agent foo`) is installed once.
+                let mut named_agents: Vec<String> = Vec::with_capacity(agent.len());
+                for id in agent {
+                    if !named_agents.contains(&id) {
+                        named_agents.push(id);
                     }
+                }
+                // Resolve and validate every agent before installing any, so a
+                // `--local` run naming an agent without project-scoped config
+                // fails up front instead of after earlier agents were installed.
+                let mut integrations = Vec::with_capacity(named_agents.len());
+                for id in &named_agents {
+                    let ag = tokensave::agents::get_integration(id)?;
+                    if local && !ag.supports_local() {
+                        return Err(tokensave::errors::TokenSaveError::Config {
+                            message: format!(
+                                "--local is not supported for \"{}\" — it has no project-scoped config. \
+                                 Run a global install instead (omit --local).",
+                                ag.id()
+                            ),
+                        });
+                    }
+                    integrations.push(ag);
+                }
+                let mut touched_global_cfg = false;
+                for (id, ag) in named_agents.iter().zip(integrations) {
+                    let name = ag.name().to_string();
+                    let ctx = tokensave::agents::InstallContext {
+                        home: home.clone(),
+                        tokensave_bin: tokensave_bin.clone(),
+                        tool_permissions: tokensave::agents::install_tool_perms(want_wildcard),
+                        scope: scope.clone(),
+                        force_permission_style,
+                    };
+                    ag.install(&ctx)?;
+                    // A --local install is project-scoped; it must not touch the
+                    // global installed-agents registry (which `reinstall`
+                    // replays as global installs) or persist global user
+                    // config.
+                    if local {
+                        installed_names.push(name);
+                    } else {
+                        if !user_cfg.installed_agents.contains(id) {
+                            user_cfg.installed_agents.push(id.clone());
+                            installed_names.push(name);
+                        }
+                        touched_global_cfg = true;
+                    }
+                }
+                if touched_global_cfg {
                     user_cfg.save();
                 }
             } else {
@@ -827,7 +899,40 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
 
             // Best-effort during `install`: a hook that could not be written
             // must not fail the whole install. The reason was already printed.
-            let _ = tokensave::agents::offer_git_post_commit_hook(&tokensave_bin, git_hook);
+            //
+            // Since #506 the hooks go into the current repository rather than
+            // claiming a global `core.hooksPath` — a single machine-wide slot
+            // whose capture breaks every other tool's hook installer. `init`
+            // has always been per-repository for the same reason. `--git-hook
+            // global` still takes the slot for anyone who wants it.
+            match git_hook {
+                tokensave::agents::GitHookMode::Global => {
+                    let _ = tokensave::agents::offer_git_post_commit_hook(&tokensave_bin, git_hook);
+                }
+                tokensave::agents::GitHookMode::No => {}
+                mode => {
+                    if let Some(warning) = tokensave::agents::global_hookspath_conflict_warning() {
+                        eprintln!("{warning}");
+                    }
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                    let forced = matches!(mode, tokensave::agents::GitHookMode::Yes);
+                    if forced && tokensave::agents::repo_hooks_dir(&cwd).is_none() {
+                        // `install` is machine-wide and is often run outside a
+                        // repository, so the default path stays quiet. Asking
+                        // for the hooks explicitly and getting nothing is worth
+                        // a word, since the request could not be honored.
+                        eprintln!(
+                            "  \x1b[33m⚠\x1b[0m --git-hook yes installs this repository's hooks, \
+                             but {} is not a git repository.\n     Run it inside one, or use \
+                             `tokensave init` / `tokensave githooks on --local --path <repo>`.\n     \
+                             For one hook directory shared by every repo: `--git-hook global`.",
+                            cwd.display()
+                        );
+                    } else {
+                        offer_local_git_hooks(&cwd, forced, false);
+                    }
+                }
+            }
         }
         Commands::Reinstall {
             wildcard_permissions,
@@ -871,7 +976,7 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     agents.len(),
                     agents.join(", ")
                 );
-                for id in &agents {
+                let failed = tokensave::agents::reinstall_agents(&agents, |id| {
                     let ag = tokensave::agents::get_integration(id)?;
                     let ctx = tokensave::agents::InstallContext {
                         home: home.clone(),
@@ -880,9 +985,17 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                         scope: tokensave::agents::InstallScope::Global,
                         force_permission_style,
                     };
-                    ag.install(&ctx)?;
+                    ag.install(&ctx)
+                });
+                if failed.is_empty() {
+                    eprintln!("\x1b[32m✔\x1b[0m All agents reinstalled");
+                } else {
+                    eprintln!(
+                        "\x1b[33mwarning:\x1b[0m could not refresh tokensave config for: {}.\n  \
+                         Run \x1b[1mtokensave install\x1b[0m to see the error.",
+                        failed.join(", ")
+                    );
                 }
-                eprintln!("\x1b[32m✔\x1b[0m All agents reinstalled");
                 user_cfg.last_installed_version = env!("CARGO_PKG_VERSION").to_string();
                 user_cfg.save();
                 if let Some(warning) = tokensave::agents::cargo_build_binary_warning(&tokensave_bin)
@@ -890,6 +1003,17 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     eprintln!("{warning}");
                 }
             }
+
+            // #624: hooks are not an agent, so the loop above never touched
+            // them, and the hook migrations an upgrade ships only reached a
+            // user who also ran `githooks on`. Refresh tokensave's section of
+            // hooks that are already installed — global ones, and this
+            // repository's own — without installing any that are not.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            report_hook_refresh(&tokensave::agents::refresh_installed_git_hooks(
+                &cwd,
+                &current_bin_path(),
+            ));
         }
         Commands::Uninstall {
             agent,
@@ -979,9 +1103,21 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
         Commands::HookPreToolUse => {
             tokensave::hooks::hook_pre_tool_use();
         }
+        Commands::HookPreToolUseCodex => {
+            tokensave::hooks::hook_pre_tool_use_codex();
+        }
         Commands::HookPromptSubmit => {
             tokensave::hooks::hook_prompt_submit().await;
         }
+        Commands::Hook { action } => match action {
+            cli::HookAction::PostCheckout {
+                prev_head,
+                new_head: _,
+                branch_flag,
+            } => {
+                commands::hook_post_checkout(prev_head.as_deref(), branch_flag.as_deref()).await;
+            }
+        },
         Commands::HookStop => {
             tokensave::hooks::hook_stop().await;
         }
@@ -1035,30 +1171,72 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             let project_path = tokensave::config::resolve_path_with_discovery(path);
             // Track the first stdin line if we need to peek at `initialize` roots.
             let mut peeked_line: Option<String> = None;
+            // The registered projects, loaded at most once and only when
+            // discovery fails: every fallback below and a server with no
+            // default project read the same list (#606).
+            let mut registered: Option<Vec<serve::RegisteredProject>> = None;
             let cg = match serve::ensure_initialized(&project_path).await {
-                Ok(cg) => cg,
+                Ok(cg) => Some(cg),
+                // An explicit `--path` names the project to serve. A folder
+                // without an index gets no default project rather than
+                // whichever registered project a fallback would pick, which
+                // would answer about a project the host never asked for
+                // (#606).
+                Err(_) if explicit_path => None,
                 Err(_) => {
-                    // CWD-based discovery failed (e.g. VS Code launched us from ~).
-                    // Fall back to the global DB's registered projects.
-                    match serve::resolve_serve_from_global_db().await {
-                        Some(p) => serve::ensure_initialized(&p).await?,
+                    // A linked worktree outside its main checkout: the upward
+                    // walk cannot reach the main index, so borrow it the way a
+                    // nested worktree would. Otherwise CWD-based discovery
+                    // failed (e.g. VS Code launched us from ~): fall back to
+                    // the global DB's registered projects, and last of all to
+                    // the MCP `initialize` roots (e.g. a VS Code multi-folder
+                    // workspace), read from the first stdin line.
+                    let fallback = match serve::resolve_serve_from_main_worktree() {
+                        Some(p) => Some(p),
                         None => {
-                            // Last resort: peek at the first stdin line for MCP
-                            // `initialize` roots (e.g. VS Code multi-folder workspace).
-                            match serve::resolve_serve_from_mcp_roots(&mut peeked_line).await {
-                                Some(p) => serve::ensure_initialized(&p).await?,
+                            let projects =
+                                registered.insert(serve::load_registered_projects().await);
+                            match serve::resolve_serve_from_global_db(projects) {
+                                Some(p) => Some(p),
                                 None => {
-                                    return Err(tokensave::errors::TokenSaveError::Config {
-                                        message: format!(
-                                            "no TokenSave index found at '{}' and no projects registered in the global database — run 'tokensave init' in your project first",
-                                            project_path.display()
-                                        ),
-                                    });
+                                    serve::resolve_serve_from_mcp_roots(&mut peeked_line, projects)
+                                        .await
                                 }
                             }
                         }
+                    };
+                    match fallback {
+                        Some(p) => Some(serve::ensure_initialized(&p).await?),
+                        None => None,
                     }
                 }
+            };
+            let Some(cg) = cg else {
+                // No project resolved (#606). Exiting here left the host with
+                // a failed server and the session with no tools at all,
+                // although `graph_root` still reaches every registered
+                // project. Serve with no default project.
+                eprintln!(
+                    "[tokensave] no TokenSave index found at '{}'; serving with no default \
+                     project — tool calls must pass graph_root",
+                    project_path.display()
+                );
+                let registered = match registered {
+                    Some(registered) => registered,
+                    None => serve::load_registered_projects().await,
+                };
+                let registered = registered
+                    .iter()
+                    .map(|project| project.path().to_string_lossy().into_owned())
+                    .collect();
+                // No index is open, so none of the per-project startup below
+                // applies: no scope warning, memory baseline, or server
+                // registry entry, which records which server holds which index.
+                tokensave::cancel::install_signal_handlers();
+                watch_for_orphaning();
+                let server = tokensave::mcp::McpServer::new_without_project(registered).await;
+                run_mcp_server(&server, timings, peeked_line, idle_timeout_secs).await?;
+                exit_after_serve();
             };
 
             // Set the shutdown flag the instant a signal arrives, rather than
@@ -1104,43 +1282,11 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
             } else {
                 tokensave::mcp::McpServer::new(cg, scope_prefix).await
             };
-            server.set_timings_enabled(timings);
-            let mut transport = tokensave::mcp::StdioTransport::new();
-            // If we peeked at stdin to read `initialize` roots, replay that line.
-            if let Some(line) = peeked_line {
-                server.handle_and_write(&line, &mut transport).await;
-            }
-            server
-                .run_with_idle_timeout(
-                    &mut transport,
-                    idle_timeout_secs.map(std::time::Duration::from_secs),
-                )
-                .await?;
-            server.shutdown().await;
+            run_mcp_server(&server, timings, peeked_line, idle_timeout_secs).await?;
             // A hard kill skips this; that is what reaping on startup and on
             // read is for.
             tokensave::servers::unregister();
-            // Exit explicitly rather than unwinding out of `main` (#450/#436).
-            //
-            // `tokio::io::stdin()` performs its reads on a blocking thread,
-            // and a blocking task cannot be cancelled — so the outstanding
-            // read is still parked when the run loop leaves. Dropping the
-            // runtime waits for it, and under a supervisor that holds our
-            // stdin open it never completes: the server ran its whole
-            // graceful shutdown, printed its summary, and then sat there
-            // alive and unkillable by anything short of `SIGKILL`. That is
-            // the reported "kill did nothing" and the servers that "never
-            // exit" under a live parent.
-            //
-            // Shutdown has already persisted counters and checkpointed the
-            // WAL, and is idempotent, so there is nothing left to unwind for.
-            // Flush stdout first: a response written just before a signal
-            // must still reach the client.
-            {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-            std::process::exit(0);
+            exit_after_serve();
         }
         Commands::Servers { json } => {
             let entries = tokensave::servers::list();
@@ -1226,9 +1372,12 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                 (Some("on"), false) => {
                     // The specific reason was already printed; this only stops
                     // `githooks on` from reporting a failed install as success.
+                    // `githooks on` without `--local` is the explicit request
+                    // for the machine-wide hooks; `--local` above is how the
+                    // caller asks for this repository's own.
                     if let Err(message) = tokensave::agents::offer_git_post_commit_hook(
                         &current_bin_path(),
-                        tokensave::agents::GitHookMode::Yes,
+                        tokensave::agents::GitHookMode::Global,
                     ) {
                         return Err(tokensave::errors::TokenSaveError::Config { message });
                     }
@@ -1244,6 +1393,11 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     }
                 }
                 (None, false) => {
+                    if tokensave::agents::repo_hooks_dir(&repo).is_some() {
+                        for line in tokensave::agents::describe_local_git_hooks(&repo) {
+                            eprintln!("{line}");
+                        }
+                    }
                     for line in tokensave::agents::describe_git_hooks() {
                         eprintln!("{line}");
                     }
@@ -1279,6 +1433,81 @@ async fn run(cli: Cli) -> tokensave::errors::Result<()> {
                     let status = if config.git_ignore { "on" } else { "off" };
                     eprintln!("gitignore: {status}");
                 }
+            }
+        }
+        Commands::AuditEdges { top, json } => {
+            let project_path = tokensave::config::resolve_path_with_discovery(None);
+            if !TokenSave::is_initialized(&project_path) {
+                return Err(tokensave::errors::TokenSaveError::Config {
+                    message: format!(
+                        "no TokenSave index at '{}' — run `tokensave init` first",
+                        project_path.display()
+                    ),
+                });
+            }
+            let cg = TokenSave::open(&project_path).await?;
+            let report = tokensave::edge_audit::audit(cg.db(), top).await?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "total_edges": report.total_edges,
+                        "gated_edges": report.gated_edges,
+                        "cross_file": report.cross_file,
+                        "sole_candidate_cross_file": report.sole_candidate_cross_file,
+                        "unreachable": report.unreachable,
+                        "hot_targets": report.hot_targets.iter().map(|t| serde_json::json!({
+                            "name": t.name,
+                            "file": t.file_path,
+                            "line": t.start_line,
+                            "kind": t.kind,
+                            "source_files": t.source_files,
+                            "edges": t.edges,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("Edge audit — {}", project_path.display());
+                println!(
+                    "  total edges                       {:>8}",
+                    report.total_edges
+                );
+                println!(
+                    "  in gated languages (py/js/ts)     {:>8}",
+                    report.gated_edges
+                );
+                println!(
+                    "    cross-file                      {:>8}",
+                    report.cross_file
+                );
+                println!(
+                    "    sole-candidate                  {:>8}",
+                    report.sole_candidate_cross_file
+                );
+                println!(
+                    "      without reachability evidence {:>8}   <- diff this between commits",
+                    report.unreachable
+                );
+
+                if report.hot_targets.is_empty() {
+                    println!("\nNo unreachable sole-candidate cross-file targets.");
+                } else {
+                    println!("\nMost-collided targets:");
+                    for t in &report.hot_targets {
+                        println!(
+                            "  {:>6} edges from {:>4} files  {}:{}  {} ({})",
+                            t.edges, t.source_files, t.file_path, t.start_line, t.name, t.kind
+                        );
+                    }
+                }
+                println!(
+                    "\nAn edge counted here is one the index asserts but the source file \
+                     carries no\nevidence it can reach — same directory, the name imported, \
+                     or the owning class\nimported. Unlike a production-to-tests/ count it \
+                     also sees phantoms landing inside\nproduction, and needs no \
+                     test/production classification."
+                );
             }
         }
         Commands::Doctor { agent } => {
@@ -1593,6 +1822,36 @@ fn resolve_install_scope(
     }
 }
 
+/// Whether `TOKENSAVE_SKIP_AGENT_MAINTENANCE` turns off every startup
+/// maintenance task: the silent reinstall, the install-stale check, the
+/// worldwide-counter flush, and the managed-rules refresh that rides along
+/// with the resync.
+///
+/// The test suite needs this (#575). A test that spawns the freshly built
+/// binary carries a `CARGO_PKG_VERSION` ahead of whatever the machine last
+/// installed, which is signal (b) below, so the resync fires against the
+/// developer's real home and rewrites `~/.claude/rules/tokensave.md`.
+/// Redirecting `HOME` does not contain it: the rules write resolves its home
+/// through [`tokensave::agents::home_dir`] (`HOME`, then `USERPROFILE`) while
+/// the version marker that gates it goes through `dirs::home_dir`, which on
+/// Windows asks `SHGetKnownFolderPath` and ignores both. The two homes
+/// disagree, so a sandboxed run advances the marker in the real home and the
+/// write escapes anyway. `.cargo/config.toml` sets this for every `cargo
+/// test` process, alongside the `core.hooksPath` isolation that exists for
+/// the same reason.
+///
+/// Any value but the empty string and the usual falsey spellings enables it,
+/// matching `TOKENSAVE_AUTO_TRACK`.
+fn agent_maintenance_disabled_from_env(raw: Option<&str>) -> bool {
+    let Some(value) = raw else {
+        return false;
+    };
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
 fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
     matches!(
         command,
@@ -1600,6 +1859,7 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
             | Commands::Reinstall { .. }
             | Commands::Uninstall { .. }
             | Commands::Doctor { .. }
+            | Commands::AuditEdges { .. }
             // `Serve` is the hot path used by MCP clients (Claude Code,
             // Codex, etc.). Clients impose a 30 s `initialize` timeout, so
             // every pre-serve startup task — `try_flush` network round-trip,
@@ -1620,13 +1880,40 @@ fn should_skip_agent_install_maintenance(command: &Commands) -> bool {
             // silent-reinstall loop, and stdout must stay JSON-only for the
             // permission gate (see hooks.rs `hook_pre_tool_use`).
             | Commands::HookPreToolUse
+            | Commands::HookPreToolUseCodex
             | Commands::HookPromptSubmit
             | Commands::HookStop
+            | Commands::Hook { .. }
             | Commands::HookKiroPreToolUse
             | Commands::HookKiroPromptSubmit
             | Commands::HookKiroPostToolUse
             | Commands::HookDroidPreToolUse
     )
+}
+
+/// Print what `refresh_installed_git_hooks` changed (#624). Silent when
+/// nothing needed rewriting, so an up-to-date machine sees no output.
+fn report_hook_refresh(refresh: &tokensave::agents::HookRefresh) {
+    for path in &refresh.updated {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Updated tokensave's section of the git hook at {} \
+             (your own content in that file was left untouched)",
+            path.display()
+        );
+    }
+    if !refresh.failed.is_empty() {
+        let names: Vec<String> = refresh
+            .failed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m could not refresh git hooks: {}.\n  \
+             Run \x1b[1mtokensave githooks on\x1b[0m (or \x1b[1mgithooks on --local\x1b[0m \
+             inside the repository) to retry.",
+            names.join(", ")
+        );
+    }
 }
 
 /// Print what `remove_git_hooks` did. Says so explicitly when it found
@@ -1642,6 +1929,13 @@ fn report_local_hook_install(outcome: &tokensave::agents::LocalHookInstall) {
     for name in &outcome.installed {
         eprintln!(
             "\x1b[32m✔\x1b[0m Installed git {name} hook at {}",
+            outcome.hooks_dir.join(name).display()
+        );
+    }
+    for name in &outcome.migrated {
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Updated tokensave's section of the git {name} hook at {} \
+             (your own content in that file was left untouched)",
             outcome.hooks_dir.join(name).display()
         );
     }
@@ -1684,6 +1978,19 @@ fn offer_local_git_hooks(project_path: &std::path::Path, forced: bool, refused: 
         return;
     }
     if !forced && tokensave::agents::local_git_hooks_present(project_path) {
+        // Present, so nothing is installed — but tokensave's own fenced block
+        // may be an older shape than this binary writes. Rewriting it needs no
+        // prompt (#342 Q1): the fence marks the region tokensave owns and
+        // everything outside it is preserved byte-for-byte. Without this, the
+        // early return is exactly the bug the issue describes — a block that
+        // can never be updated after first install.
+        for name in tokensave::agents::migrate_local_hook_blocks(project_path, &current_bin_path())
+        {
+            eprintln!(
+                "\x1b[32m✔\x1b[0m Updated tokensave's section of the git {name} hook \
+                 (your own content in that file was left untouched)"
+            );
+        }
         return;
     }
     if !forced {
@@ -1773,7 +2080,29 @@ fn server_disabled_from_env(canonical: Option<&str>, legacy: Option<&str>) -> bo
 
 #[cfg(test)]
 mod startup_tests {
-    use super::{server_disabled_from_env, should_skip_agent_install_maintenance, Commands};
+    use super::{
+        agent_maintenance_disabled_from_env, server_disabled_from_env,
+        should_skip_agent_install_maintenance, Commands,
+    };
+
+    /// #575: `cargo test --workspace` must not rewrite the developer's real
+    /// `~/.claude/rules/tokensave.md`. `.cargo/config.toml` sets this for
+    /// every test process; unset, the maintenance path stays on so ordinary
+    /// runs are unaffected.
+    #[test]
+    fn the_env_var_turns_agent_maintenance_off() {
+        assert!(agent_maintenance_disabled_from_env(Some("1")));
+        assert!(agent_maintenance_disabled_from_env(Some("true")));
+        assert!(agent_maintenance_disabled_from_env(Some(" yes ")));
+
+        assert!(!agent_maintenance_disabled_from_env(None));
+        for falsey in ["", "0", "false", "no", "off", "OFF"] {
+            assert!(
+                !agent_maintenance_disabled_from_env(Some(falsey)),
+                "{falsey:?} should leave maintenance on"
+            );
+        }
+    }
 
     /// #419: the resync used to announce itself only as `✔ Wrote <path>` from
     /// the file layer, under a command the user had run as a query.
@@ -1837,7 +2166,7 @@ mod startup_tests {
     #[test]
     fn explicit_agent_config_commands_skip_agent_install_maintenance() {
         assert!(should_skip_agent_install_maintenance(&Commands::Install {
-            agent: Some("kiro".to_string()),
+            agent: vec!["kiro".to_string()],
             git_hook: tokensave::agents::GitHookMode::Default,
             local: false,
             wildcard_permissions: false,
@@ -1891,6 +2220,7 @@ mod startup_tests {
         // that rewrites every tracked agent's config) on each invocation.
         for command in [
             Commands::HookPreToolUse,
+            Commands::HookPreToolUseCodex,
             Commands::HookPromptSubmit,
             Commands::HookStop,
             Commands::HookKiroPreToolUse,
@@ -2058,3 +2388,108 @@ fn watch_for_orphaning() {
 /// No reparenting signal to watch for off Unix.
 #[cfg(not(unix))]
 fn watch_for_orphaning() {}
+
+/// Runs a `serve` MCP server on stdio until the client leaves, the idle
+/// timeout passes, or a signal arrives, then shuts it down.
+///
+/// `peeked_line` is the first stdin line, when `serve` already read it to look
+/// for `initialize` roots; it is replayed so the server still answers it.
+async fn run_mcp_server(
+    server: &std::sync::Arc<tokensave::mcp::McpServer>,
+    timings: bool,
+    peeked_line: Option<String>,
+    idle_timeout_secs: Option<u64>,
+) -> tokensave::errors::Result<()> {
+    server.set_timings_enabled(timings);
+    let mut transport = tokensave::mcp::StdioTransport::new();
+    if let Some(line) = peeked_line {
+        server.handle_and_write(&line, &mut transport).await;
+    }
+    server
+        .run_with_idle_timeout(
+            &mut transport,
+            idle_timeout_secs.map(std::time::Duration::from_secs),
+        )
+        .await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Ends a `serve` process once its server has shut down.
+///
+/// Exits explicitly rather than unwinding out of `main` (#450/#436).
+/// `tokio::io::stdin()` performs its reads on a blocking thread, and a blocking
+/// task cannot be cancelled — so the outstanding read is still parked when the
+/// run loop leaves. Dropping the runtime waits for it, and under a supervisor
+/// that holds our stdin open it never completes: the server ran its whole
+/// graceful shutdown, printed its summary, and then sat there alive and
+/// unkillable by anything short of `SIGKILL`. That is the reported "kill did
+/// nothing" and the servers that "never exit" under a live parent.
+///
+/// Shutdown has already persisted counters and checkpointed the WAL, and is
+/// idempotent, so there is nothing left to unwind for. Stdout is flushed
+/// first: a response written just before a signal must still reach the client.
+fn exit_after_serve() -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spinner_tail;
+
+    /// A short message is passed through untouched, with no ellipsis.
+    #[test]
+    fn a_short_message_is_not_truncated() {
+        assert_eq!(
+            spinner_tail("[1/10] syncing src/lib.rs"),
+            "[1/10] syncing src/lib.rs"
+        );
+    }
+
+    /// The tail of a long ASCII message is kept, prefixed with an ellipsis.
+    #[test]
+    fn a_long_ascii_message_keeps_its_tail() {
+        let text = format!(
+            "[8/3000] syncing {}/deep/nested/file.rs (ETA: 184s)",
+            "a".repeat(80)
+        );
+        let out = spinner_tail(&text);
+        assert!(out.starts_with('…'), "expected an ellipsis prefix: {out}");
+        assert!(
+            out.ends_with("(ETA: 184s)"),
+            "expected the tail to survive: {out}"
+        );
+    }
+
+    /// The regression: a byte cut landing inside a Hangul character must not
+    /// panic. The `.md`/`a.md`/`ab.md` suffixes walk the cut through every
+    /// offset inside a 3-byte character, so one of them lands mid-character
+    /// whatever the exact message length.
+    #[test]
+    fn a_cut_inside_a_multibyte_character_does_not_panic() {
+        for suffix in ["", "a", "ab"] {
+            let text = format!(
+                "[8/3000] syncing 문서/1310_플랫폼아키텍처개요문서설치안내가이드입니다{suffix}.md (ETA: 184s)"
+            );
+            let out = spinner_tail(&text);
+            assert!(out.starts_with('…'), "expected an ellipsis prefix: {out}");
+            assert!(
+                out.ends_with(".md (ETA: 184s)"),
+                "expected the tail to survive: {out}"
+            );
+        }
+    }
+
+    /// The same cut over 4-byte characters, where a naive `+1` fixup would
+    /// still land inside the character.
+    #[test]
+    fn a_cut_inside_a_four_byte_character_does_not_panic() {
+        for pad in 0..4 {
+            let text = format!("{}{} done", "🚀".repeat(20), "x".repeat(pad));
+            let out = spinner_tail(&text);
+            assert!(out.ends_with("done"), "expected the tail to survive: {out}");
+        }
+    }
+}

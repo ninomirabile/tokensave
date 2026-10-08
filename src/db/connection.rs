@@ -57,6 +57,18 @@ fn is_transient_connect_error(err: &TokenSaveError) -> bool {
     }
 }
 
+/// How long a writable connection waits on another connection's lock, in
+/// milliseconds: two minutes, or `TOKENSAVE_BUSY_TIMEOUT_MS` when set.
+///
+/// The override exists so a test can hold a lock and see an open give up in
+/// about a second, rather than after five attempts of two minutes each.
+fn busy_timeout_ms() -> u64 {
+    std::env::var("TOKENSAVE_BUSY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(120_000)
+}
+
 /// Short exponential backoff (20, 40, 80, 160 ms) between connect attempts,
 /// small enough to stay invisible on a normal run that never retries.
 fn connect_retry_backoff(attempt: u32) -> std::time::Duration {
@@ -70,6 +82,9 @@ pub struct Database {
     _db: LibsqlDatabase,
     read_only: bool,
     pub(super) trait_dispatch_callers: RwLock<HashMap<String, Vec<CachedTraitDispatchCaller>>>,
+    /// Serializes write transactions so concurrent edit reindex and background
+    /// sync cannot open overlapping transactions on the shared connection (#563).
+    pub(super) write_lock: tokio::sync::Mutex<()>,
 }
 
 impl Database {
@@ -123,6 +138,7 @@ impl Database {
             _db: db,
             read_only: false,
             trait_dispatch_callers: RwLock::new(HashMap::new()),
+            write_lock: tokio::sync::Mutex::new(()),
         };
         database.refresh_trait_dispatch_callers().await?;
         Ok((database, false))
@@ -170,6 +186,7 @@ impl Database {
             _db: db,
             read_only: false,
             trait_dispatch_callers: RwLock::new(HashMap::new()),
+            write_lock: tokio::sync::Mutex::new(()),
         };
         database.refresh_trait_dispatch_callers().await?;
         Ok((database, migrated))
@@ -254,6 +271,7 @@ impl Database {
             _db: db,
             read_only: true,
             trait_dispatch_callers: RwLock::new(HashMap::new()),
+            write_lock: tokio::sync::Mutex::new(()),
         };
         database.refresh_trait_dispatch_callers().await?;
         Ok(database)
@@ -417,11 +435,12 @@ impl Database {
     /// small projects don't pay the 320 MB baseline of a large project.
     async fn apply_pragmas(conn: &Connection, db_file_size: u64) -> Result<()> {
         let (cache_kb, mmap) = adaptive_cache_sizes(db_file_size);
+        let busy_ms = busy_timeout_ms();
         conn.execute_batch(&format!(
             "PRAGMA page_size = 8192;
              PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 120000;
+             PRAGMA busy_timeout = {busy_ms};
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -{cache_kb};
              PRAGMA temp_store = MEMORY;

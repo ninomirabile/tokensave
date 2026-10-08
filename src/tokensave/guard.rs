@@ -52,6 +52,43 @@ pub(crate) fn sync_in_progress(project_root: &Path) -> bool {
 }
 
 /// Deletes the database and its WAL/SHM sidecars.
+/// Takes the project's sync lock for a destructive rebuild of `db_path`, or
+/// says why the rebuild must not happen.
+///
+/// A rebuild deletes the database file. Another tokensave process that has
+/// it open (a running `serve`, a sync, a hook) would keep reading and writing
+/// the unlinked inode while this process builds a new one, so the rebuild is
+/// refused while the sync lock is held or a registered server serves this
+/// project or database.
+pub(crate) fn rebuild_refusal(
+    project_root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> std::result::Result<SyncLockGuard, String> {
+    let lock = try_acquire_sync_lock(project_root)
+        .map_err(|e| format!("{e}. Stop the other tokensave process and run the command again."))?;
+    let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+    let db = canonical(db_path);
+    let root = canonical(project_root);
+    let me = std::process::id();
+    let holders: Vec<String> = crate::servers::reap()
+        .into_iter()
+        .filter(|s| s.pid != me)
+        .filter(|s| {
+            canonical(std::path::Path::new(&s.db_path)) == db
+                || canonical(std::path::Path::new(&s.project_path)) == root
+        })
+        .map(|s| s.pid.to_string())
+        .collect();
+    if !holders.is_empty() {
+        return Err(format!(
+            "a tokensave server (PID {}) is serving this project. Stop it (see `tokensave \
+             servers`) and run the command again.",
+            holders.join(", ")
+        ));
+    }
+    Ok(lock)
+}
+
 pub(crate) fn delete_db_files(db_path: &std::path::Path) {
     let _ = std::fs::remove_file(db_path);
     // WAL and SHM files use the same base name with different extensions
@@ -158,6 +195,95 @@ pub fn try_acquire_sync_lock(project_root: &Path) -> Result<SyncLockGuard> {
     Ok(SyncLockGuard { path: lock_path })
 }
 
+const BRANCH_OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const BRANCH_OPERATION_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// RAII guard for the branch-copy and metadata-update portion of branch add.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct BranchOperationLock {
+    path: PathBuf,
+}
+
+impl Drop for BranchOperationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the project-wide branch-operation lock, waiting for another
+/// branch add or auto-track operation to finish.
+///
+/// This lock is separate from `sync.lock`: branch operations coordinate their
+/// copy and metadata steps, while sync contention remains an error from the
+/// existing sync lock.
+#[doc(hidden)]
+pub async fn acquire_branch_operation_lock(tokensave_dir: &Path) -> Result<BranchOperationLock> {
+    acquire_branch_operation_lock_with_timeout(tokensave_dir, BRANCH_OPERATION_LOCK_TIMEOUT).await
+}
+
+async fn acquire_branch_operation_lock_with_timeout(
+    tokensave_dir: &Path,
+    timeout: Duration,
+) -> Result<BranchOperationLock> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(lock) = try_acquire_branch_operation_lock(tokensave_dir)? {
+            return Ok(lock);
+        }
+        if started.elapsed() >= timeout {
+            return Err(TokenSaveError::BranchLock {
+                message: format!(
+                    "branch add lock timed out after {} seconds",
+                    timeout.as_secs()
+                ),
+            });
+        }
+        tokio::time::sleep(BRANCH_OPERATION_LOCK_POLL).await;
+    }
+}
+
+fn try_acquire_branch_operation_lock(tokensave_dir: &Path) -> Result<Option<BranchOperationLock>> {
+    use std::io::Write;
+    let lock_path = tokensave_dir.join("branch-add.lock");
+    let pid = std::process::id();
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{pid}");
+            return Ok(Some(BranchOperationLock { path: lock_path }));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(TokenSaveError::BranchLock {
+                message: format!("could not create branch add lockfile: {e}"),
+            });
+        }
+    }
+
+    let contents = std::fs::read_to_string(&lock_path).unwrap_or_default();
+    if let Ok(existing_pid) = contents.trim().parse::<u32>() {
+        if is_pid_alive(existing_pid) {
+            return Ok(None);
+        }
+    }
+
+    let _ = std::fs::remove_file(&lock_path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|e| TokenSaveError::BranchLock {
+            message: format!("could not reclaim branch add lockfile: {e}"),
+        })?;
+    let _ = write!(f, "{pid}");
+    Ok(Some(BranchOperationLock { path: lock_path }))
+}
+
 /// Returns `true` if a process with the given PID is currently running.
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -183,5 +309,46 @@ pub(crate) fn is_pid_alive(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn branch_operation_lock_waits_for_the_same_branch_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_branch_operation_lock(dir.path()).await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(first);
+        });
+
+        let second = acquire_branch_operation_lock(dir.path()).await.unwrap();
+        release.await.unwrap();
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn branch_operation_lock_times_out_with_an_explicit_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = acquire_branch_operation_lock(dir.path()).await.unwrap();
+
+        let error =
+            acquire_branch_operation_lock_with_timeout(dir.path(), Duration::from_millis(20))
+                .await
+                .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("branch add lock"),
+            "expected branch-add lock context: {message}"
+        );
+        assert!(
+            message.contains("timed out"),
+            "expected bounded timeout: {message}"
+        );
     }
 }

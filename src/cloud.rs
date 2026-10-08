@@ -29,10 +29,94 @@ struct WorkerResponse {
     total: u64,
 }
 
+/// Whether the OS trust store can supply any root certificates at all.
+///
+/// `RootCerts::PlatformVerifier` **replaces** ureq's bundled Mozilla roots
+/// rather than adding to them — `RootCerts` is an enum — and on Linux/BSD
+/// `rustls-platform-verifier` hard-errors when the system store yields
+/// nothing:
+///
+/// ```text
+/// if root_store.is_empty() {
+///     return Err(rustls::Error::General(
+///         "No CA certificates were loaded from the system".to_owned(),
+///     ));
+/// }
+/// ```
+///
+/// There is no fallback there, so a host with no `ca-certificates` installed —
+/// a distroless or `scratch` container, a minimal CI image — goes from working
+/// on the bundled roots to having no HTTPS at all. Probing first keeps that
+/// host on the bundled roots instead.
+///
+/// The probe uses the same loader `rustls-platform-verifier` itself uses on
+/// these targets, so it answers the question the verifier is about to ask —
+/// including honouring `SSL_CERT_FILE` and `SSL_CERT_DIR`. macOS and Windows
+/// query OS APIs with no equivalent empty-store failure, so they always use
+/// the platform verifier.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+fn platform_roots_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(probe_platform_roots)
+}
+
+#[cfg(not(all(unix, not(target_vendor = "apple"), not(target_os = "android"))))]
+fn platform_roots_available() -> bool {
+    true
+}
+
+/// The uncached probe behind [`platform_roots_available`].
+///
+/// Separate so a test can run it against a deliberately empty trust store;
+/// production always goes through the cached wrapper, since the answer cannot
+/// change within a process and the load reads the filesystem.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+#[doc(hidden)]
+pub fn probe_platform_roots() -> bool {
+    !rustls_native_certs::load_native_certs().certs.is_empty()
+}
+
+/// The root-certificate source for every HTTPS call tokensave makes.
+///
+/// Prefers the OS trust store, so a corporate TLS-intercepting proxy whose
+/// root CA is installed there (e.g. Cato) does not break every call — the
+/// problem #526 fixed. Falls back to the bundled Mozilla roots when the OS
+/// has no store to offer, which is strictly the safer direction: the bundled
+/// set is a fixed, audited list, so falling back can only ever narrow what is
+/// trusted, never widen it.
+fn root_certs() -> ureq::tls::RootCerts {
+    use ureq::tls::RootCerts;
+
+    // Once per process, and only on the rare fallback path. Someone behind an
+    // intercepting proxy otherwise has no way to tell why their OS-installed
+    // CA is being ignored; everyone else never sees this.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+
+    if platform_roots_available() {
+        return RootCerts::PlatformVerifier;
+    }
+
+    WARNED.call_once(|| {
+        eprintln!(
+            "  \x1b[33m⚠\x1b[0m No CA certificates found in the system trust store; \
+             using tokensave's bundled roots.\n     Install `ca-certificates` if you need \
+             a certificate your OS trusts (e.g. a TLS-inspecting proxy's) to be honoured."
+        );
+    });
+    RootCerts::WebPki
+}
+
 /// Creates a ureq agent with the given timeout.
+///
+/// Root certificates come from [`root_certs`]: the OS trust store where there
+/// is one, ureq's bundled Mozilla roots where there is not. TLS verification
+/// itself is unaffected — only the set of trust anchors changes.
 pub fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
+    use ureq::tls::TlsConfig;
+
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .tls_config(TlsConfig::builder().root_certs(root_certs()).build())
         .build()
         .into()
 }
@@ -217,6 +301,67 @@ pub fn fetch_latest_version_passive() -> Option<String> {
     fetch_latest_version()
 }
 
+/// Why a version check produced no installable version.
+///
+/// These have different remedies and must not share a message: collapsing
+/// them into a single `None` is what made a release with no asset for the
+/// running platform report itself as an unreachable network (#513).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionCheckError {
+    /// The releases API could not be reached, or its answer could not be read.
+    Unreachable {
+        /// What the HTTP layer actually reported — a 404 and a connection
+        /// timeout are both worth telling apart.
+        detail: String,
+    },
+    /// GitHub answered, but the release has no asset for this platform.
+    NoAssetForPlatform {
+        /// Version of the release that is missing the asset, without the `v`.
+        version: String,
+        /// Platform slug the running binary needs.
+        platform: String,
+        /// Asset name that was looked for and not found.
+        expected: String,
+        /// Asset names the release does publish.
+        available: Vec<String>,
+    },
+    /// GitHub answered, but the channel has no release at all.
+    NoRelease {
+        /// Channel that is empty, as the user names it.
+        channel: &'static str,
+    },
+}
+
+impl std::fmt::Display for VersionCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable { detail } => write!(f, "could not reach GitHub ({detail})"),
+            Self::NoAssetForPlatform {
+                version,
+                platform,
+                expected,
+                available,
+            } => {
+                write!(
+                    f,
+                    "v{version} has no asset for {platform} (expected {expected})"
+                )?;
+                if available.is_empty() {
+                    write!(f, "; that release publishes no assets at all")
+                } else {
+                    write!(f, "; published assets: {}", available.join(", "))
+                }
+            }
+            Self::NoRelease { channel } => write!(f, "no {channel} release has been published"),
+        }
+    }
+}
+
+impl std::error::Error for VersionCheckError {}
+
+/// A version check: the version string, or why there isn't one.
+pub type VersionResult = std::result::Result<String, VersionCheckError>;
+
 /// Fetches the latest release version from GitHub.
 /// For beta builds, fetches the latest prerelease; for stable builds,
 /// fetches the latest stable release. This ensures each channel only
@@ -224,49 +369,123 @@ pub fn fetch_latest_version_passive() -> Option<String> {
 /// uploaded the current-platform binary are skipped — see
 /// `release_has_current_platform_asset`.
 pub fn fetch_latest_version() -> Option<String> {
+    try_fetch_latest_version().ok()
+}
+
+/// Fetches the latest version for this channel, or why there is none.
+///
+/// # Errors
+///
+/// See [`try_fetch_latest_stable_version`] and [`try_fetch_latest_beta_version`].
+pub fn try_fetch_latest_version() -> VersionResult {
     if is_beta() {
-        fetch_latest_beta_version()
+        try_fetch_latest_beta_version()
     } else {
-        fetch_latest_stable_version()
+        try_fetch_latest_stable_version()
     }
 }
 
 /// Fetches the latest stable release version from GitHub.
+///
+/// Returns `None` for every failure alike; use
+/// [`try_fetch_latest_stable_version`] where the reason matters.
 pub fn fetch_latest_stable_version() -> Option<String> {
+    try_fetch_latest_stable_version().ok()
+}
+
+/// Fetches the latest stable release version, or why there is none.
+///
+/// # Errors
+///
+/// [`VersionCheckError::Unreachable`] when the releases API cannot be reached
+/// or its response cannot be parsed, [`VersionCheckError::NoAssetForPlatform`]
+/// when GitHub answers but the release carries no asset for this platform.
+pub fn try_fetch_latest_stable_version() -> VersionResult {
     let agent = agent_with_timeout(FETCH_TIMEOUT);
     let release: GitHubRelease = agent
         .get(GITHUB_RELEASES_URL)
         .header("User-Agent", "tokensave")
         .call()
-        .ok()?
+        .map_err(unreachable)?
         .body_mut()
         .read_json()
-        .ok()?;
-    if !release_has_current_platform_asset(&release) {
-        return None;
-    }
-    Some(release.tag_name.trim_start_matches('v').to_string())
+        .map_err(unreachable)?;
+    select_stable(&release)
 }
 
 /// Fetches the latest prerelease version from GitHub.
+///
+/// Returns `None` for every failure alike; use
+/// [`try_fetch_latest_beta_version`] where the reason matters.
 pub fn fetch_latest_beta_version() -> Option<String> {
+    try_fetch_latest_beta_version().ok()
+}
+
+/// Fetches the latest installable prerelease version, or why there is none.
+///
+/// # Errors
+///
+/// As [`try_fetch_latest_stable_version`], plus
+/// [`VersionCheckError::NoRelease`] when the beta channel is empty.
+pub fn try_fetch_latest_beta_version() -> VersionResult {
     let agent = agent_with_timeout(FETCH_TIMEOUT);
     let releases: Vec<GitHubRelease> = agent
         .get(GITHUB_RELEASES_LIST_URL)
         .header("User-Agent", "tokensave")
         .call()
-        .ok()?
+        .map_err(unreachable)?
         .body_mut()
         .read_json()
-        .ok()?;
-    // First prerelease that has the current platform's asset already
-    // uploaded. GitHub returns the list newest-first, so the first match
-    // is the latest installable beta. Releases whose CI is still in
-    // progress are skipped — they will be picked up on the next check.
-    releases
-        .into_iter()
-        .find(|r| r.prerelease && release_has_current_platform_asset(r))
-        .map(|r| r.tag_name.trim_start_matches('v').to_string())
+        .map_err(unreachable)?;
+    select_beta(releases)
+}
+
+/// Picks the version out of the latest stable release.
+fn select_stable(release: &GitHubRelease) -> VersionResult {
+    if release_has_current_platform_asset(release) {
+        return Ok(release.tag_name.trim_start_matches('v').to_string());
+    }
+    Err(no_asset_error(release))
+}
+
+/// Picks the newest prerelease whose current-platform asset is already up.
+///
+/// GitHub returns the list newest-first, so the first match is the latest
+/// installable beta. A release whose CI is still uploading is skipped and
+/// picked up on a later check; if none of them is installable, the newest
+/// prerelease is the one worth naming in the error.
+fn select_beta(releases: Vec<GitHubRelease>) -> VersionResult {
+    let mut newest: Option<GitHubRelease> = None;
+    for release in releases.into_iter().filter(|r| r.prerelease) {
+        if release_has_current_platform_asset(&release) {
+            return Ok(release.tag_name.trim_start_matches('v').to_string());
+        }
+        if newest.is_none() {
+            newest = Some(release);
+        }
+    }
+    match newest {
+        Some(release) => Err(no_asset_error(&release)),
+        None => Err(VersionCheckError::NoRelease { channel: "beta" }),
+    }
+}
+
+/// Builds the "nothing for your platform" error describing `release`.
+fn no_asset_error(release: &GitHubRelease) -> VersionCheckError {
+    let version = release.tag_name.trim_start_matches('v').to_string();
+    VersionCheckError::NoAssetForPlatform {
+        expected: asset_name(&version, release.prerelease),
+        platform: current_platform().to_string(),
+        available: release.assets.iter().map(|a| a.name.clone()).collect(),
+        version,
+    }
+}
+
+/// Wraps a transport or decoding failure as [`VersionCheckError::Unreachable`].
+fn unreachable(error: impl std::fmt::Display) -> VersionCheckError {
+    VersionCheckError::Unreachable {
+        detail: error.to_string(),
+    }
 }
 
 /// Returns true if the current build is a beta/prerelease version.
@@ -452,6 +671,55 @@ pub fn upgrade_command(_method: &InstallMethod) -> &'static str {
 mod tests {
     use super::*;
 
+    /// `RootCerts::PlatformVerifier` only takes effect under the rustls
+    /// provider; a provider/feature mismatch would panic at agent-construction
+    /// time rather than at the call site, which would otherwise surface only
+    /// as an unexplained crash on a user's first HTTPS call.
+    #[test]
+    fn agent_with_timeout_builds_with_platform_roots() {
+        let _ = agent_with_timeout(Duration::from_secs(1));
+    }
+
+    /// Whichever branch `root_certs` takes on this machine, the agent has to
+    /// build — `WebPki` is compiled in behind its own feature and would panic
+    /// at construction if it were not, exactly like the platform verifier.
+    #[test]
+    fn both_root_certificate_sources_build_an_agent() {
+        use ureq::tls::{RootCerts, TlsConfig};
+
+        for roots in [RootCerts::PlatformVerifier, RootCerts::WebPki] {
+            let _agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(1)))
+                .tls_config(TlsConfig::builder().root_certs(roots).build())
+                .build()
+                .into();
+        }
+    }
+
+    /// The fallback must be the *bundled* roots, never "no verification".
+    /// Getting this backwards would turn a missing CA store into a silently
+    /// unverified connection, which is far worse than the outage it avoids.
+    #[test]
+    fn the_fallback_narrows_trust_rather_than_disabling_it() {
+        let chosen = root_certs();
+        assert!(
+            matches!(chosen, ureq::tls::RootCerts::PlatformVerifier)
+                || matches!(chosen, ureq::tls::RootCerts::WebPki),
+            "root_certs must pick a verifying source, never a disabled one"
+        );
+    }
+
+    /// The probe is consulted once and must be stable within a process — an
+    /// agent built early and one built late have to trust the same roots.
+    #[test]
+    fn the_platform_root_probe_is_stable() {
+        assert_eq!(
+            platform_roots_available(),
+            platform_roots_available(),
+            "the probe is cached; repeated calls must agree"
+        );
+    }
+
     fn cfg(
         pending: u64,
         last_upload_at: i64,
@@ -585,6 +853,101 @@ mod tests {
         let expected = asset_name("9.9.9-beta.1", true);
         let r = release("v9.9.9-beta.1", true, &[&expected]);
         assert!(release_has_current_platform_asset(&r));
+    }
+
+    // --- #513: a missing asset must be distinguishable from an unreachable host ---
+
+    #[test]
+    fn stable_selection_reports_missing_asset_not_unreachable() {
+        // v7.11.1 as published: every platform but this one. The old code
+        // returned None here, which `upgrade` spelled "could not reach GitHub".
+        // The real v7.11.1 asset list, minus whichever entry matches the
+        // platform this test happens to run on.
+        let mine = asset_name("7.11.1", false);
+        let published: Vec<String> = [
+            "tokensave-v7.11.1-aarch64-linux.tar.gz",
+            "tokensave-v7.11.1-aarch64-macos.tar.gz",
+            "tokensave-v7.11.1-x86_64-linux.tar.gz",
+        ]
+        .iter()
+        .map(|n| (*n).to_string())
+        .filter(|n| *n != mine)
+        .collect();
+        let names: Vec<&str> = published.iter().map(String::as_str).collect();
+        let r = release("v7.11.1", false, &names);
+        let err = select_stable(&r).expect_err("no asset for this platform");
+        match &err {
+            VersionCheckError::NoAssetForPlatform {
+                version, available, ..
+            } => {
+                assert_eq!(version, "7.11.1");
+                assert_eq!(available.len(), names.len());
+            }
+            other => panic!("expected NoAssetForPlatform, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("7.11.1"), "{msg}");
+        assert!(msg.contains(current_platform()), "{msg}");
+        assert!(
+            !msg.contains("could not reach"),
+            "a missing asset must not be reported as a network fault: {msg}"
+        );
+    }
+
+    #[test]
+    fn stable_selection_returns_version_when_asset_present() {
+        let r = release("v9.9.9", false, &[&asset_name("9.9.9", false)]);
+        assert_eq!(select_stable(&r).unwrap(), "9.9.9");
+    }
+
+    #[test]
+    fn beta_selection_skips_incomplete_release_for_older_complete_one() {
+        // Newest beta is still uploading; the one before it is installable.
+        let releases = vec![
+            release("v9.9.9-beta.2", true, &[]),
+            release("v9.9.9-beta.1", true, &[&asset_name("9.9.9-beta.1", true)]),
+        ];
+        assert_eq!(select_beta(releases).unwrap(), "9.9.9-beta.1");
+    }
+
+    #[test]
+    fn beta_selection_reports_newest_prerelease_when_none_installable() {
+        let releases = vec![
+            release(
+                "v9.9.9-beta.2",
+                true,
+                &["tokensave-beta-v9.9.9-beta.2-other.tar.gz"],
+            ),
+            release("v9.9.8", false, &[&asset_name("9.9.8", false)]),
+        ];
+        match select_beta(releases).expect_err("no installable beta") {
+            VersionCheckError::NoAssetForPlatform { version, .. } => {
+                assert_eq!(version, "9.9.9-beta.2");
+            }
+            other => panic!("expected NoAssetForPlatform, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn beta_selection_reports_no_release_when_channel_is_empty() {
+        let releases = vec![release("v9.9.8", false, &[&asset_name("9.9.8", false)])];
+        assert!(matches!(
+            select_beta(releases).expect_err("no betas at all"),
+            VersionCheckError::NoRelease { channel: "beta" }
+        ));
+    }
+
+    #[test]
+    fn unreachable_keeps_the_network_wording_and_carries_the_cause() {
+        let err = VersionCheckError::Unreachable {
+            detail: "http status: 503".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("could not reach GitHub"), "{msg}");
+        assert!(
+            msg.contains("503"),
+            "the underlying cause is worth surfacing: {msg}"
+        );
     }
 
     #[test]

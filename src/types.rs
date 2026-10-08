@@ -268,6 +268,8 @@ pub enum EdgeKind {
     /// hierarchy, not invocation, and folding it into `Calls` would pollute
     /// callers/callees, impact, and dead-code for every other language.
     Instantiates,
+    /// Another declaration of the same Ruby class or module.
+    Reopens,
 }
 
 #[allow(clippy::should_implement_trait)]
@@ -287,6 +289,7 @@ impl EdgeKind {
             EdgeKind::Receives => "receives",
             EdgeKind::Documents => "documents",
             EdgeKind::Instantiates => "instantiates",
+            EdgeKind::Reopens => "reopens",
         }
     }
 
@@ -305,6 +308,7 @@ impl EdgeKind {
             "receives" => Some(EdgeKind::Receives),
             "documents" => Some(EdgeKind::Documents),
             "instantiates" => Some(EdgeKind::Instantiates),
+            "reopens" => Some(EdgeKind::Reopens),
             _ => None,
         }
     }
@@ -403,6 +407,176 @@ pub struct Edge {
     pub target: String,
     pub kind: EdgeKind,
     pub line: Option<u32>,
+    /// Which resolver path produced this edge (#544). `None` for an edge an
+    /// extractor emitted directly from the syntax tree, and for rows written
+    /// before the column existed.
+    #[serde(default)]
+    pub resolved_by: Option<ResolvedBy>,
+}
+
+impl Edge {
+    /// Orders duplicate edges by how well their provenance is established:
+    /// 0 for an exact resolution, 1 for a heuristic one, 2 for none recorded.
+    ///
+    /// Several references on one line can resolve to the same target by
+    /// different paths (`c.bump()` and `Counter::bump` from one call), and
+    /// the unique edge index keeps only one row. Sorting by this rank before
+    /// deduplicating keeps the strongest provenance instead of an arbitrary
+    /// one (#544).
+    #[must_use]
+    pub fn provenance_rank(&self) -> u8 {
+        match self.resolved_by {
+            Some(r) if r.is_exact() => 0,
+            Some(_) => 1,
+            None => 2,
+        }
+    }
+
+    /// [`Self::provenance_rank`], then the code itself, so that two
+    /// duplicates of the same rank always collapse to the same label rather
+    /// than to whichever an unstable sort left first.
+    #[must_use]
+    pub fn provenance_key(&self) -> (u8, u8) {
+        (
+            self.provenance_rank(),
+            self.resolved_by.map_or(u8::MAX, |r| r as u8),
+        )
+    }
+}
+
+/// Appended to every edge `INSERT`: a duplicate of an existing edge is still
+/// skipped, but one carrying a provenance fills in a row that has none.
+///
+/// The extractor's own copy of an edge (no provenance) can reach the table
+/// before the resolver's in an incremental sync; without this the first row
+/// won and a sync labelled the edge differently from a full index (#544).
+pub const EDGE_UPSERT_CLAUSE: &str = " ON CONFLICT DO UPDATE SET resolved_by = \
+     excluded.resolved_by WHERE edges.resolved_by IS NULL AND excluded.resolved_by IS NOT NULL";
+
+/// How the resolver bound a reference to its target (#544).
+///
+/// Persisted as a small integer in `edges.resolved_by` rather than as the
+/// string the resolver reports, because the edges table is the largest in
+/// the database: an integer of 1–127 costs one byte per row. The codes are a
+/// storage format. Never renumber one; add new variants at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum ResolvedBy {
+    /// The only node in the project with the referenced name.
+    ExactMatch = 1,
+    /// The best of several same-named candidates, picked by scoring.
+    ExactMatchScored = 2,
+    /// A `::`-qualified path matched a qualified name.
+    QualifiedMatch = 3,
+    /// The trailing segment of `recv.method` or `Type::method`, as the only
+    /// candidate with that name.
+    SimpleNameMatch = 4,
+    /// The trailing segment, best of several candidates by scoring.
+    SimpleNameMatchScored = 5,
+    /// A Go `pkg.Name` selector, through the file's imports.
+    GoSelectorImport = 6,
+    /// A blocklisted common name, bound to the one same-file candidate.
+    SameFileBlocklist = 7,
+    /// A Ruby `self.method` call on the enclosing class or module.
+    RubySelfReceiver = 8,
+    /// A Ruby `Constant.method` call on that constant's singleton method.
+    RubyConstantReceiver = 9,
+    /// A `GDScript` call through a statically typed receiver.
+    GdscriptTypedReceiver = 10,
+    /// Copied from a call to a build-variant twin (`#[cfg]` sibling).
+    BuildVariant = 11,
+    /// The trailing segment of a `::` path that matched no qualified name,
+    /// as the only candidate with that name.
+    PathTailMatch = 12,
+    /// The trailing segment of a `::` path, best of several by scoring.
+    PathTailMatchScored = 13,
+    /// A relative JavaScript / TypeScript import specifier bound to the file
+    /// it names, with TypeScript's `.js` to `.ts` mapping applied (#647).
+    RelativeImport = 14,
+}
+
+impl ResolvedBy {
+    /// Every variant, in code order.
+    pub const ALL: [ResolvedBy; 14] = [
+        ResolvedBy::ExactMatch,
+        ResolvedBy::ExactMatchScored,
+        ResolvedBy::QualifiedMatch,
+        ResolvedBy::SimpleNameMatch,
+        ResolvedBy::SimpleNameMatchScored,
+        ResolvedBy::GoSelectorImport,
+        ResolvedBy::SameFileBlocklist,
+        ResolvedBy::RubySelfReceiver,
+        ResolvedBy::RubyConstantReceiver,
+        ResolvedBy::GdscriptTypedReceiver,
+        ResolvedBy::BuildVariant,
+        ResolvedBy::PathTailMatch,
+        ResolvedBy::PathTailMatchScored,
+        ResolvedBy::RelativeImport,
+    ];
+
+    /// The resolver's name for this path, as `ResolvedRef::resolved_by` holds it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolvedBy::ExactMatch => "exact-match",
+            ResolvedBy::ExactMatchScored => "exact-match-scored",
+            ResolvedBy::QualifiedMatch => "qualified-match",
+            ResolvedBy::SimpleNameMatch => "simple-name-match",
+            ResolvedBy::SimpleNameMatchScored => "simple-name-match-scored",
+            ResolvedBy::GoSelectorImport => "go-selector-import",
+            ResolvedBy::SameFileBlocklist => "same-file-blocklist",
+            ResolvedBy::RubySelfReceiver => "ruby-self-receiver",
+            ResolvedBy::RubyConstantReceiver => "ruby-constant-receiver",
+            ResolvedBy::GdscriptTypedReceiver => "gdscript-typed-receiver",
+            ResolvedBy::BuildVariant => "build-variant",
+            ResolvedBy::PathTailMatch => "path-tail-match",
+            ResolvedBy::PathTailMatchScored => "path-tail-match-scored",
+            ResolvedBy::RelativeImport => "relative-import",
+        }
+    }
+
+    /// Parses the resolver's string name. `None` for an unknown name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == name)
+    }
+
+    /// The integer stored in `edges.resolved_by`.
+    #[must_use]
+    pub fn code(self) -> i64 {
+        i64::from(self as u8)
+    }
+
+    /// Decodes a stored code. `None` for a code this build does not know.
+    #[must_use]
+    pub fn from_code(code: i64) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.code() == code)
+    }
+
+    /// True when the resolver had a single candidate it could justify: a
+    /// qualified path, a typed or constant receiver, a Go import, or a name
+    /// (bare, or the tail of a `::` path) that no other node in the project
+    /// carries.
+    ///
+    /// False for the fallbacks where a same-named symbol elsewhere could be
+    /// the real target: the tail of a dotted receiver call (`recv.method`,
+    /// receiver type unknown), a winner picked by scoring among several
+    /// candidates, a blocklisted common name, and a build-variant copy.
+    #[must_use]
+    pub fn is_exact(self) -> bool {
+        matches!(
+            self,
+            ResolvedBy::ExactMatch
+                | ResolvedBy::QualifiedMatch
+                | ResolvedBy::PathTailMatch
+                | ResolvedBy::GoSelectorImport
+                | ResolvedBy::RubySelfReceiver
+                | ResolvedBy::RubyConstantReceiver
+                | ResolvedBy::GdscriptTypedReceiver
+                | ResolvedBy::RelativeImport
+        )
+    }
 }
 
 /// What kind of file a [`FileRecord`] describes.
@@ -589,6 +763,11 @@ pub struct GraphStats {
     pub last_sync_at: u64,
     /// Timestamp of the most recent full (re)index (0 if never indexed).
     pub last_full_sync_at: u64,
+    /// tokensave version that performed the most recent full (re)index.
+    /// Empty when the project has never been fully indexed by a recorded
+    /// version, so consumers can tell "graph built by X" as a fact rather
+    /// than inferring it from `last_indexed_version` (#554).
+    pub last_full_index_version: String,
     /// Duration in milliseconds of the most recent sync (0 if unknown).
     pub last_sync_duration_ms: u64,
 }
@@ -776,6 +955,11 @@ pub struct AmbiguousCall {
     pub file_path: String,
     /// Line of the call site.
     pub line: u32,
+    /// Column of the call site. Held in memory only, to tell apart two calls
+    /// on one line while a resolution pass runs (#597); it is not stored, so
+    /// a record read back from the database carries 0.
+    #[serde(skip)]
+    pub column: u32,
     /// The candidates that could not be separated.
     pub candidate_node_ids: Vec<String>,
 }
@@ -802,6 +986,12 @@ pub struct EditResult {
     pub matched_str: String,
     pub new_str: String,
     pub message: String,
+    /// 1-based inclusive line range changed by the edit.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
+    /// Nearest candidate line when the edit failed to find its target.
+    pub nearest: Option<String>,
 }
 
 /// Result of a multi-string replacement edit.
@@ -825,6 +1015,26 @@ pub struct InsertResult {
     pub anchor_line: u32,
     pub content: String,
     pub before: bool,
+    pub message: String,
+    /// 1-based inclusive line range changed by the edit.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
+    /// Nearest candidate line when the edit failed to find its anchor.
+    pub nearest: Option<String>,
+}
+
+/// Result of a line-range replacement edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineReplaceResult {
+    pub success: bool,
+    pub file_path: String,
+    /// Fully-resolved absolute filesystem path that was actually read/written.
+    pub resolved_path: String,
+    /// 1-based inclusive line range replaced.
+    pub changed_lines: (u32, u32),
+    /// SHA-256 hex digest of the file after the edit.
+    pub digest: String,
     pub message: String,
 }
 

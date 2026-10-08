@@ -67,11 +67,28 @@ pub struct BranchDrift {
 // ---------------------------------------------------------------------------
 
 impl TokenSave {
+    /// Normalizes `path` to the DB's project-relative, forward-slash form,
+    /// returning `None` when it points outside `project_root`.
+    fn relative_in_root(&self, path: &str) -> Option<String> {
+        let normalized = normalize_rel_path(path);
+        let candidate = Path::new(&normalized);
+        if !candidate.is_absolute() {
+            return (!normalized.starts_with("../")).then_some(normalized);
+        }
+        // Compare canonicalized forms so a symlinked or `..`-laden absolute
+        // path cannot slip past a textual prefix check.
+        let root =
+            std::fs::canonicalize(&self.project_root).unwrap_or_else(|_| self.project_root.clone());
+        let abs = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+        let rel = abs.strip_prefix(&root).ok()?;
+        Some(normalize_rel_path(&rel.to_string_lossy()))
+    }
+
     /// Check whether the given files need (re-/un-)indexing to bring the DB
     /// into agreement with the filesystem.
     ///
     /// A file is reported stale when any of:
-    /// - it is in the DB and has been modified on disk since `indexed_at`,
+    /// - it is in the DB and has been modified on disk since `modified_at`,
     /// - it is in the DB but no longer exists on disk (deletion — DB needs cleanup),
     /// - it exists on disk but has no DB record (new file — needs indexing).
     ///
@@ -85,7 +102,17 @@ impl TokenSave {
             // under `src/foo.py` and the file gets treated as "new" — a
             // subsequent sync would insert a *second* row alongside the
             // original, which is #87.
-            let normalized = normalize_rel_path(path);
+            // Tools accept an absolute path so edits can reach a sibling
+            // worktree, but such a file must never enter *this* graph: with an
+            // absolute argument `join` discards the base, the row would be
+            // written under its absolute path, and the served project would
+            // start answering with another project's symbols (#528). Rewrite
+            // an absolute path that is genuinely inside the root, and drop the
+            // rest — the same way a path in neither the DB nor on disk is
+            // dropped below.
+            let Some(normalized) = self.relative_in_root(path) else {
+                continue;
+            };
             let abs_path = self.project_root.join(&normalized);
             let file_exists = abs_path.exists();
             match self.db.get_file(&normalized).await {
@@ -93,15 +120,9 @@ impl TokenSave {
                     if !file_exists {
                         // Indexed but deleted — DB needs cleanup.
                         stale.push(normalized);
-                    } else if let Ok(metadata) = std::fs::metadata(&abs_path) {
-                        if let Ok(mtime) = metadata.modified() {
-                            let mtime_secs = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            if mtime_secs > record.indexed_at {
-                                stale.push(normalized);
-                            }
+                    } else if let Some((mtime, _)) = crate::sync::file_stat(&abs_path) {
+                        if mtime > record.modified_at {
+                            stale.push(normalized);
                         }
                     }
                 }
@@ -116,7 +137,7 @@ impl TokenSave {
         stale
     }
 
-    /// Returns every file whose on-disk mtime is newer than its indexed
+    /// Returns every file whose on-disk mtime is newer than its recorded
     /// timestamp, plus on-disk files the DB doesn't know about yet, plus
     /// DB-known files that no longer exist on disk (so a follow-up sync
     /// can prune them).
@@ -136,9 +157,9 @@ impl TokenSave {
             return on_disk;
         };
 
-        let indexed_map: HashMap<&str, i64> = indexed
+        let modified_map: HashMap<&str, i64> = indexed
             .iter()
-            .map(|f| (f.path.as_str(), f.indexed_at))
+            .map(|f| (f.path.as_str(), f.modified_at))
             .collect();
         let on_disk_set: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
 
@@ -146,18 +167,14 @@ impl TokenSave {
 
         for rel in &on_disk {
             let abs = self.project_root.join(rel);
-            let mtime_secs = std::fs::metadata(&abs)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs() as i64);
-            match indexed_map.get(rel.as_str()) {
-                Some(&indexed_at) if mtime_secs <= indexed_at => {}
+            let mtime = crate::sync::file_stat(&abs).map_or(0, |(mtime, _)| mtime);
+            match modified_map.get(rel.as_str()) {
+                Some(&modified_at) if mtime <= modified_at => {}
                 _ => stale.push(rel.clone()),
             }
         }
 
-        for indexed_path in indexed_map.keys() {
+        for indexed_path in modified_map.keys() {
             if !on_disk_set.contains(*indexed_path) {
                 stale.push((*indexed_path).to_string());
             }

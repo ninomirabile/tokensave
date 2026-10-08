@@ -105,6 +105,16 @@ fn claude_rules_path(claude_dir: &Path) -> PathBuf {
     claude_dir.join("rules").join("tokensave.md")
 }
 
+/// Path to the user-level managed tokensave rules file for Claude Code.
+///
+/// Public so the upgrade resync can refresh an existing rules file even when
+/// `claude` is absent from `installed_agents` (#553): a user may register
+/// tokensave per project (`.mcp.json`) or remove the user-scope entry, while
+/// `~/.claude/rules/tokensave.md` remains tokensave's own file.
+pub fn claude_managed_rules_path(home: &Path) -> PathBuf {
+    claude_rules_path(&claude_config_dir(home))
+}
+
 /// The directory named by `CLAUDE_CONFIG_DIR`, or `None` when unset/empty.
 fn claude_config_dir_override() -> Option<PathBuf> {
     let raw = std::env::var_os("CLAUDE_CONFIG_DIR")?;
@@ -1254,20 +1264,34 @@ fn perm_is_covered(perm: &str, installed: &[&str]) -> bool {
     })
 }
 
-/// Emit a warning if the current tokensave version expects tool permissions
-/// that aren't present in `settings`.
-fn warn_missing_permissions(settings: &serde_json::Value) {
+/// Number of expected tokensave tool permissions that `settings` does not
+/// grant. Zero when the allow list holds no tokensave entry at all: Claude
+/// Code was never set up with tokensave (e.g. only Codex is installed), so
+/// `tokensave reinstall` would not touch this file and a warning telling the
+/// user to run it could never clear.
+fn missing_permission_count(settings: &serde_json::Value) -> usize {
     let installed: Vec<&str> = settings["permissions"]["allow"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    let expected = expected_tool_perms();
-    let missing_count = expected
+    let has_tokensave_grant = installed
+        .iter()
+        .any(|e| *e == "mcp__tokensave" || e.starts_with("mcp__tokensave__"));
+    if !has_tokensave_grant {
+        return 0;
+    }
+
+    expected_tool_perms()
         .iter()
         .filter(|p| !perm_is_covered(p, &installed))
-        .count();
+        .count()
+}
 
+/// Emit a warning if the current tokensave version expects tool permissions
+/// that aren't present in `settings`.
+fn warn_missing_permissions(settings: &serde_json::Value) {
+    let missing_count = missing_permission_count(settings);
     if missing_count > 0 {
         crate::agent_note!(
             "\x1b[33mwarning: {missing_count} new tokensave tool(s) not yet permitted. Run `tokensave reinstall` to update permissions.\x1b[0m"
@@ -2269,6 +2293,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // doctor_check_permissions / warn_missing_permissions recognition
     // -----------------------------------------------------------------------
+
+    /// A Claude settings file with no tokensave grant belongs to a user who
+    /// never installed tokensave for Claude (e.g. Codex-only). `reinstall`
+    /// leaves it alone, so the stale-permission warning must not fire.
+    #[test]
+    fn missing_count_is_zero_without_any_tokensave_grant() {
+        let settings = json!({ "permissions": { "allow": ["Bash", "Read"] } });
+        assert_eq!(missing_permission_count(&settings), 0);
+        assert_eq!(missing_permission_count(&json!({})), 0);
+    }
+
+    #[test]
+    fn missing_count_reports_partial_tokensave_grants() {
+        let settings = json!({ "permissions": { "allow": ["mcp__tokensave__tokensave_search"] } });
+        assert_eq!(
+            missing_permission_count(&settings),
+            expected_tool_perms().len() - 1
+        );
+    }
+
+    #[test]
+    fn missing_count_is_zero_with_wildcard_grant() {
+        let settings = json!({ "permissions": { "allow": ["mcp__tokensave__*"] } });
+        assert_eq!(missing_permission_count(&settings), 0);
+    }
 
     #[test]
     fn doctor_passes_with_full_wildcard_grant() {

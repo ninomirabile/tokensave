@@ -1,7 +1,8 @@
 //! Shared helpers for integration tests.
 //!
-//! Each integration test binary compiles this module independently, so not
-//! every helper is used by every test.
+//! Compiled once into the shared `integration` test binary and once into each
+//! isolated `[[test]]` target that declares it, so not every helper is used by
+//! every binary.
 #![allow(dead_code)]
 
 use std::path::Path;
@@ -56,4 +57,37 @@ pub fn make_install_ctx_with_real_bin(home: &Path) -> InstallContext {
 pub fn read_json(path: &Path) -> serde_json::Value {
     let contents = std::fs::read_to_string(path).unwrap();
     serde_json::from_str(&contents).unwrap()
+}
+
+/// The libtest name of `test` declared in the module at `module_path`, for a
+/// test that re-runs its own binary with `--exact`. libtest names omit the
+/// crate, so `integration::sync_test` + `foo` is `sync_test::foo`, while a
+/// test at the root of its own binary is just `foo`.
+pub fn qualified_test_name(module_path: &str, test: &str) -> String {
+    match module_path.split_once("::") {
+        Some((_, module)) => format!("{module}::{test}"),
+        None => test.to_string(),
+    }
+}
+
+/// `path` canonicalized and spelled the way tokensave reports a root: without
+/// the `\\?\` verbatim prefix that [`Path::canonicalize`] adds on Windows.
+/// Identical to `canonicalize` elsewhere (macOS still resolves `/var` to
+/// `/private/var`).
+pub fn reported_root(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap().to_string_lossy().into_owned();
+    if let Some(rest) = canonical.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = canonical.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        canonical
+    }
+}
+
+/// `value` as it appears inside a JSON string or a JSON-quoted message, without
+/// the surrounding quotes. A Windows path's backslashes come out doubled.
+pub fn json_escaped(value: &str) -> String {
+    let quoted = serde_json::to_string(value).unwrap();
+    quoted[1..quoted.len() - 1].to_string()
 }

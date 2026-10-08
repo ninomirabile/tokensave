@@ -6,6 +6,78 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 impl Database {
+    /// Link later Ruby declarations to a stable representative of the same constant.
+    /// Keep declaration nodes separate so their source locations and members survive.
+    /// Recomputing the full relation after each Ruby change also repairs links after deletions and moves.
+    pub async fn rebuild_ruby_reopenings(&self) -> Result<()> {
+        let _write_guard = self.write_lock.lock().await;
+        self.conn()
+            .execute("BEGIN", ())
+            .await
+            .map_err(|e| TokenSaveError::Database {
+                message: format!("failed to begin Ruby reopening rebuild: {e}"),
+                operation: "rebuild_ruby_reopenings".to_string(),
+            })?;
+
+        // Ruby extraction currently writes file::file::name; the single-prefix branch accepts older or alternate rows, and ltrim removes the absolute :: marker from names such as class ::Entry.
+        let result = async {
+            self.conn()
+                .execute("DELETE FROM edges WHERE kind = 'reopens'", ())
+                .await?;
+            self.conn()
+                .execute(
+                    "INSERT INTO edges (source, target, kind, line)
+                     SELECT id, canonical_id, 'reopens', start_line
+                     FROM (
+                         SELECT id, start_line,
+                                FIRST_VALUE(id) OVER declaration AS canonical_id,
+                                ROW_NUMBER() OVER declaration AS declaration_number
+                         FROM (
+                             SELECT id, kind, file_path, start_line, start_column,
+                                    ltrim(CASE
+                                        WHEN substr(qualified_name, 1, length(file_path) * 2 + 4) = file_path || '::' || file_path || '::'
+                                        THEN substr(qualified_name, length(file_path) * 2 + 5)
+                                        ELSE substr(qualified_name, length(file_path) + 3)
+                                    END, ':') AS constant_name
+                             FROM nodes
+                             WHERE kind IN ('class', 'module')
+                               AND (file_path LIKE '%.rb' OR file_path LIKE '%.rake' OR file_path LIKE '%.erb' OR file_path LIKE '%.slim')
+                               AND qualified_name NOT LIKE '%<anonymous>%'
+                               AND substr(qualified_name, 1, length(file_path) + 2) = file_path || '::'
+                         )
+                         WINDOW declaration AS (
+                             PARTITION BY kind, constant_name
+                             ORDER BY file_path, start_line, start_column, id
+                         )
+                     )
+                     WHERE declaration_number > 1",
+                    (),
+                )
+                .await?;
+            Ok::<(), libsql::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => self
+                .conn()
+                .execute("COMMIT", ())
+                .await
+                .map(|_| ())
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to commit Ruby reopening rebuild: {e}"),
+                    operation: "rebuild_ruby_reopenings".to_string(),
+                }),
+            Err(e) => {
+                let _ = self.conn().execute("ROLLBACK", ()).await;
+                Err(TokenSaveError::Database {
+                    message: format!("failed to rebuild Ruby reopenings: {e}"),
+                    operation: "rebuild_ruby_reopenings".to_string(),
+                })
+            }
+        }
+    }
+
     /// Inserts a single edge, skipping silently if either endpoint is missing.
     pub async fn insert_edge(&self, edge: &Edge) -> Result<()> {
         // Contains is denormalized to nodes.parent_id since v9. Fold the
@@ -25,15 +97,18 @@ impl Database {
         }
         self.conn()
             .execute(
-                "INSERT OR IGNORE INTO edges (source, target, kind, line) \
-                 SELECT ?1, ?2, ?3, ?4 \
-                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
-                   AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2)",
+                &format!(
+                    "INSERT INTO edges (source, target, kind, line, resolved_by) \
+                     SELECT ?1, ?2, ?3, ?4, ?5 \
+                     WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
+                       AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2){EDGE_UPSERT_CLAUSE}"
+                ),
                 params![
                     edge.source.as_str(),
                     edge.target.as_str(),
                     edge.kind.as_str(),
-                    edge.line.map(i64::from)
+                    edge.line.map(i64::from),
+                    edge.resolved_by.map(ResolvedBy::code)
                 ],
             )
             .await
@@ -69,12 +144,12 @@ impl Database {
         // when an edge references a node from a not-yet-indexed file.
         let stmt = self
             .conn()
-            .prepare(
-                "INSERT OR IGNORE INTO edges (source, target, kind, line) \
-                 SELECT ?1, ?2, ?3, ?4 \
-                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
-                   AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2)",
-            )
+            .prepare(&format!(
+                "INSERT INTO edges (source, target, kind, line, resolved_by) \
+                     SELECT ?1, ?2, ?3, ?4, ?5 \
+                     WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1) \
+                       AND EXISTS (SELECT 1 FROM nodes WHERE id = ?2){EDGE_UPSERT_CLAUSE}"
+            ))
             .await
             .map_err(|e| TokenSaveError::Database {
                 message: format!("failed to prepare: {e}"),
@@ -107,6 +182,7 @@ impl Database {
                 edge.target.as_str(),
                 edge.kind.as_str(),
                 edge.line.map(i64::from),
+                edge.resolved_by.map(ResolvedBy::code),
             ])
             .await
             .map_err(|e| TokenSaveError::Database {
@@ -139,7 +215,7 @@ impl Database {
             let mut rows = self
                 .conn()
                 .query(
-                    "SELECT source, target, kind, line FROM edges WHERE source = ?1",
+                    "SELECT source, target, kind, line, resolved_by FROM edges WHERE source = ?1",
                     params![source_id],
                 )
                 .await
@@ -156,7 +232,7 @@ impl Database {
                 .map(|(i, _)| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges WHERE source = ?1 AND kind IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE source = ?1 AND kind IN ({})",
                 placeholders.join(", ")
             );
 
@@ -191,7 +267,7 @@ impl Database {
             let mut rows = self
                 .conn()
                 .query(
-                    "SELECT source, target, kind, line FROM edges WHERE target = ?1",
+                    "SELECT source, target, kind, line, resolved_by FROM edges WHERE target = ?1",
                     params![target_id],
                 )
                 .await
@@ -208,7 +284,7 @@ impl Database {
                 .map(|(i, _)| format!("?{}", i + 2))
                 .collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges WHERE target = ?1 AND kind IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE target = ?1 AND kind IN ({})",
                 placeholders.join(", ")
             );
 
@@ -322,6 +398,7 @@ impl Database {
                 target: trait_method_id.clone(),
                 kind: EdgeKind::Calls,
                 line: (stored_line >= 0).then_some(stored_line as u32),
+                resolved_by: None,
             };
             callers.entry(concrete_method_id).or_default().push((
                 caller,
@@ -381,7 +458,7 @@ impl Database {
 
         let sql = if kinds.is_empty() {
             format!(
-                "SELECT source, target, kind, line FROM edges WHERE target IN ({})",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE target IN ({})",
                 target_placeholders.join(", ")
             )
         } else {
@@ -392,7 +469,7 @@ impl Database {
                 param_values.push(libsql::Value::Text(k.as_str().to_string()));
             }
             format!(
-                "SELECT source, target, kind, line FROM edges \
+                "SELECT source, target, kind, line, resolved_by FROM edges \
                  WHERE target IN ({}) AND kind IN ({})",
                 target_placeholders.join(", "),
                 kind_placeholders.join(", ")
@@ -459,8 +536,8 @@ impl Database {
 
     /// Histogram of annotation / attribute / decorator usages across the
     /// project. Each row is `(annotation_name, count)` sorted descending by
-    /// count. Optional `path_prefix` restricts to nodes whose `file_path`
-    /// starts with that string.
+    /// count. Optional `path_prefix` restricts to nodes in that file or under
+    /// that directory.
     ///
     /// "Annotation" here is the language-neutral term for Rust attributes
     /// (`#[derive(...)]`, `#[cfg(test)]`), Python decorators (`@pytest.fixture`),
@@ -471,14 +548,14 @@ impl Database {
         path_prefix: Option<&str>,
     ) -> Result<Vec<(String, u64)>> {
         let (sql, args) = if let Some(prefix) = path_prefix {
-            (
+            let mut sql = String::from(
                 "SELECT name, COUNT(*) AS n \
                  FROM nodes \
-                 WHERE kind = 'annotation_usage' AND file_path LIKE ?1 \
-                 GROUP BY name ORDER BY n DESC, name ASC"
-                    .to_string(),
-                libsql::params_from_iter(vec![libsql::Value::Text(format!("{prefix}%"))]),
-            )
+                 WHERE kind = 'annotation_usage' AND ",
+            );
+            push_path_prefix_filter(&mut sql, "", prefix);
+            sql.push_str(" GROUP BY name ORDER BY n DESC, name ASC");
+            (sql, libsql::params_from_iter(Vec::<libsql::Value>::new()))
         } else {
             (
                 "SELECT name, COUNT(*) AS n \
@@ -517,8 +594,8 @@ impl Database {
     /// - `name`: annotation name (`"test"`, `"derive"`, `"cfg"`, etc.). When
     ///   `None`, returns sites for *all* annotations — useful with `path_prefix`
     ///   to enumerate every annotation in a sub-tree.
-    /// - `path_prefix`: restrict to target nodes whose `file_path` starts with
-    ///   this string.
+    /// - `path_prefix`: restrict to target nodes in this file or under this
+    ///   directory.
     /// - `target_kind`: restrict to targets of this kind
     ///   (`"function"`, `"method"`, `"struct"`, `"module"`, …).
     /// - `limit`: cap the number of rows returned (callers typically pass
@@ -546,8 +623,8 @@ impl Database {
             let _ = write!(sql, " AND a.name = ?{}", params.len());
         }
         if let Some(prefix) = path_prefix {
-            params.push(libsql::Value::Text(format!("{prefix}%")));
-            let _ = write!(sql, " AND t.file_path LIKE ?{}", params.len());
+            sql.push_str(" AND ");
+            push_path_prefix_filter(&mut sql, "t.", prefix);
         }
         if let Some(k) = target_kind {
             params.push(libsql::Value::Text(k.to_string()));
@@ -722,9 +799,9 @@ impl Database {
                         start_line, end_line, start_column, end_column,
                         docstring, signature, visibility, is_async, branches, loops, returns, max_nesting, unsafe_blocks, unchecked_calls, assertions, updated_at, attrs_start_line, parent_id, cognitive_complexity, distinct_operators, distinct_operands, total_operators, total_operands
                  FROM nodes
-                 WHERE qualified_name LIKE ?1
+                 WHERE qualified_name LIKE ?1 ESCAPE '\\'
                  LIMIT 50",
-                format!("%::{qname}"),
+                format!("%::{}", escape_like(qname)),
             )
         } else {
             (
@@ -795,9 +872,9 @@ impl Database {
             param_idx += 1;
         }
         if let Some(prefix) = path_prefix {
-            conditions.push(format!("n.file_path LIKE ?{param_idx}"));
-            param_values.push(libsql::Value::Text(format!("{prefix}%")));
-            param_idx += 1;
+            let mut filter = String::new();
+            push_path_prefix_filter(&mut filter, "n.", prefix);
+            conditions.push(filter);
         }
 
         let where_clause = conditions.join(" AND ");
@@ -862,9 +939,9 @@ impl Database {
             param_idx += 1;
         }
         if let Some(prefix) = path_prefix {
-            conditions.push(format!("file_path LIKE ?{param_idx}"));
-            param_values.push(libsql::Value::Text(format!("{prefix}%")));
-            param_idx += 1;
+            let mut filter = String::new();
+            push_path_prefix_filter(&mut filter, "", prefix);
+            conditions.push(filter);
         }
 
         let where_clause = if conditions.is_empty() {
@@ -932,7 +1009,11 @@ impl Database {
         };
 
         let path_filter = match path_prefix {
-            Some(prefix) => format!("AND {group_alias}.file_path LIKE '{prefix}%'"),
+            Some(prefix) => {
+                let mut f = String::from("AND ");
+                push_path_prefix_filter(&mut f, &format!("{group_alias}."), prefix);
+                f
+            }
             None => String::new(),
         };
 
@@ -989,7 +1070,11 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<(Node, u64)>> {
         let path_filter = match path_prefix {
-            Some(prefix) => format!("WHERE n.file_path LIKE '{prefix}%'"),
+            Some(prefix) => {
+                let mut f = String::from("WHERE ");
+                push_path_prefix_filter(&mut f, "n.", prefix);
+                f
+            }
             None => String::new(),
         };
 
@@ -1074,28 +1159,17 @@ impl Database {
         &self,
         path_prefix: Option<&str>,
     ) -> Result<Vec<(String, String, u64)>> {
-        let (sql, param_values): (&str, Vec<libsql::Value>) = match path_prefix {
-            Some(prefix) => (
-                "SELECT file_path, kind, COUNT(*) AS cnt
-                 FROM nodes
-                 WHERE file_path LIKE ?1
-                 GROUP BY file_path, kind
-                 ORDER BY file_path, cnt DESC",
-                vec![libsql::Value::Text(format!("{prefix}%"))],
-            ),
-            None => (
-                "SELECT file_path, kind, COUNT(*) AS cnt
-                 FROM nodes
-                 GROUP BY file_path, kind
-                 ORDER BY file_path, cnt DESC",
-                vec![],
-            ),
-        };
+        let mut sql = String::from("SELECT file_path, kind, COUNT(*) AS cnt FROM nodes");
+        if let Some(prefix) = path_prefix {
+            sql.push_str(" WHERE ");
+            push_path_prefix_filter(&mut sql, "", prefix);
+        }
+        sql.push_str(" GROUP BY file_path, kind ORDER BY file_path, cnt DESC");
 
         let op = "get_node_distribution";
         let mut rows = self
             .conn()
-            .query(sql, libsql::params_from_iter(param_values))
+            .query(&sql, ())
             .await
             .map_err(|e| TokenSaveError::Database {
                 message: format!("failed to query node distribution: {e}"),
@@ -1131,13 +1205,15 @@ impl Database {
     pub async fn get_call_edges(&self, path_prefix: Option<&str>) -> Result<Vec<(String, String)>> {
         let op = "get_call_edges";
         let (sql, param_values): (String, Vec<libsql::Value>) = match path_prefix {
-            Some(prefix) => (
-                "SELECT e.source, e.target FROM edges e
+            Some(prefix) => {
+                let mut sql = String::from(
+                    "SELECT e.source, e.target FROM edges e
                  JOIN nodes n ON e.source = n.id
-                 WHERE e.kind = 'calls' AND n.file_path LIKE ?1"
-                    .to_string(),
-                vec![libsql::Value::Text(format!("{prefix}%"))],
-            ),
+                 WHERE e.kind = 'calls' AND ",
+                );
+                push_path_prefix_filter(&mut sql, "n.", prefix);
+                (sql, vec![])
+            }
             None => (
                 "SELECT source, target FROM edges WHERE kind = 'calls'".to_string(),
                 vec![],
@@ -1180,13 +1256,15 @@ impl Database {
     ) -> Result<Vec<(String, String, Option<u32>)>> {
         let op = "get_call_edges_with_lines";
         let (sql, param_values): (String, Vec<libsql::Value>) = match path_prefix {
-            Some(prefix) => (
-                "SELECT e.source, e.target, e.line FROM edges e
+            Some(prefix) => {
+                let mut sql = String::from(
+                    "SELECT e.source, e.target, e.line FROM edges e
                  JOIN nodes n ON e.source = n.id
-                 WHERE e.kind = 'calls' AND n.file_path LIKE ?1"
-                    .to_string(),
-                vec![libsql::Value::Text(format!("{prefix}%"))],
-            ),
+                 WHERE e.kind = 'calls' AND ",
+                );
+                push_path_prefix_filter(&mut sql, "n.", prefix);
+                (sql, vec![])
+            }
             None => (
                 "SELECT source, target, line FROM edges WHERE kind = 'calls'".to_string(),
                 vec![],
@@ -1248,9 +1326,9 @@ impl Database {
             }
         }
         if let Some(prefix) = path_prefix {
-            conditions.push(format!("n.file_path LIKE ?{param_idx}"));
-            param_values.push(libsql::Value::Text(format!("{prefix}%")));
-            param_idx += 1;
+            let mut filter = String::new();
+            push_path_prefix_filter(&mut filter, "n.", prefix);
+            conditions.push(filter);
         }
 
         let where_clause = conditions.join(" AND ");
@@ -1331,8 +1409,13 @@ impl Database {
             'case_class', 'kotlin_object', 'inner_class', 'abstract_method', 'constructor', \
             'struct_method', 'val', 'var', 'mixin', 'extension', 'union', 'typedef'";
 
-        let (sql, param_values): (String, Vec<libsql::Value>) = match path_prefix {
-            Some(prefix) => (
+        let path_filter = path_prefix.map(|prefix| {
+            let mut filter = String::new();
+            push_path_prefix_filter(&mut filter, "", prefix);
+            filter
+        });
+        let (sql, param_values): (String, Vec<libsql::Value>) = match &path_filter {
+            Some(path_filter) => (
                 format!(
                     "SELECT id, kind, name, qualified_name, file_path,
                             start_line, end_line, start_column, end_column,
@@ -1341,14 +1424,11 @@ impl Database {
                      WHERE visibility = 'public'
                        AND (docstring IS NULL OR docstring = '')
                        AND kind IN ({DOC_COVERAGE_KINDS})
-                       AND file_path LIKE ?1
+                       AND {path_filter}
                      ORDER BY file_path, start_line
-                     LIMIT ?2"
+                     LIMIT ?1"
                 ),
-                vec![
-                    libsql::Value::Text(format!("{prefix}%")),
-                    libsql::Value::Integer(limit as i64),
-                ],
+                vec![libsql::Value::Integer(limit as i64)],
             ),
             None => (
                 format!(
@@ -1388,7 +1468,11 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<(Node, u64, u64, u64)>> {
         let path_filter = match path_prefix {
-            Some(prefix) => format!("AND n.file_path LIKE '{prefix}%'"),
+            Some(prefix) => {
+                let mut f = String::from("AND ");
+                push_path_prefix_filter(&mut f, "n.", prefix);
+                f
+            }
             None => String::new(),
         };
 
@@ -1451,7 +1535,10 @@ impl Database {
     pub async fn get_all_edges(&self) -> Result<Vec<Edge>> {
         let mut rows = self
             .conn()
-            .query("SELECT source, target, kind, line FROM edges", ())
+            .query(
+                "SELECT source, target, kind, line, resolved_by FROM edges",
+                (),
+            )
             .await
             .map_err(|e| TokenSaveError::Database {
                 message: format!("failed to query all edges: {e}"),
@@ -1470,7 +1557,7 @@ impl Database {
         let mut rows = self
             .conn()
             .query(
-                "SELECT source, target, kind, line FROM edges WHERE kind = ?1",
+                "SELECT source, target, kind, line, resolved_by FROM edges WHERE kind = ?1",
                 params![kind.as_str()],
             )
             .await
@@ -1493,7 +1580,7 @@ impl Database {
         }
         let placeholders: Vec<String> = (0..kinds.len()).map(|i| format!("?{}", i + 1)).collect();
         let sql = format!(
-            "SELECT source, target, kind, line FROM edges WHERE kind IN ({})",
+            "SELECT source, target, kind, line, resolved_by FROM edges WHERE kind IN ({})",
             placeholders.join(", ")
         );
         let param_values: Vec<libsql::Value> = kinds
@@ -1610,7 +1697,7 @@ impl Database {
             let placeholders: Vec<String> =
                 (0..chunk.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
-                "SELECT source, target, kind, line FROM edges \
+                "SELECT source, target, kind, line, resolved_by FROM edges \
                  WHERE kind = 'calls' AND target IN ({})",
                 placeholders.join(", ")
             );
@@ -1703,6 +1790,30 @@ impl Database {
                 message: format!("failed to delete edges by source: {e}"),
                 operation: "delete_edges_by_source".to_string(),
             })?;
+        Ok(())
+    }
+
+    /// Deletes the `calls` edges that call sites may have produced, each site
+    /// given as (caller id, line, callee bare name), so a re-resolution of
+    /// every reference at those sites can write them afresh (#597).
+    pub async fn delete_call_edges_at_sites(&self, sites: &[(String, u32, String)]) -> Result<()> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        for (source, line, name) in sites {
+            self.conn()
+                .execute(
+                    "DELETE FROM edges
+                     WHERE kind = 'calls' AND source = ?1 AND line = ?2
+                       AND target IN (SELECT id FROM nodes WHERE name = ?3)",
+                    params![source.as_str(), i64::from(*line), name.as_str()],
+                )
+                .await
+                .map_err(|e| TokenSaveError::Database {
+                    message: format!("failed to delete call edges at a site: {e}"),
+                    operation: "delete_call_edges_at_sites".to_string(),
+                })?;
+        }
         Ok(())
     }
 }

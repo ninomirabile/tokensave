@@ -146,16 +146,23 @@ pub(crate) fn get_opt_string_lossy(
 
 /// Maps a row from the `edges` table to an `Edge`.
 ///
-/// Expected column order: source(0), target(1), kind(2), line(3).
+/// Expected column order: source(0), target(1), kind(2), line(3), and
+/// optionally `resolved_by`(4). A query that selects only the first four
+/// columns maps to `resolved_by: None`, as does a NULL or unknown code.
 pub(crate) fn row_to_edge(row: &libsql::Row) -> std::result::Result<Edge, libsql::Error> {
     let kind_str = row.get::<String>(2)?;
     let line = row.get::<Option<u32>>(3)?;
+    let resolved_by = match row.get_value(4) {
+        Ok(libsql::Value::Integer(code)) => ResolvedBy::from_code(code),
+        _ => None,
+    };
 
     Ok(Edge {
         source: row.get::<String>(0)?,
         target: row.get::<String>(1)?,
         kind: EdgeKind::from_str(&kind_str).unwrap_or(EdgeKind::Uses),
         line,
+        resolved_by,
     })
 }
 
@@ -217,6 +224,39 @@ pub(crate) fn push_quoted(buf: &mut String, s: &str) {
         }
     }
     buf.push('\'');
+}
+
+/// Escapes a string for use inside a `LIKE` pattern.
+///
+/// Without this, a path containing `_` or `%` acts as a wildcard: a filter for
+/// the directory `a_b` would also match `axb`. That is a wrong-results bug
+/// rather than an error, so it fails silently — which is why the escaping is
+/// paired with a test rather than left to review. `\` is the escape character,
+/// declared with `ESCAPE` at each use site.
+pub(crate) fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Appends a path-prefix filter for `<alias>file_path` to `buf`.
+///
+/// Matches the directory itself and everything under it, with the prefix
+/// quoted and `LIKE`-escaped. `alias` is a table qualifier including the dot
+/// (`"n."`) or empty for an unqualified column. Callers that need a leading
+/// `AND`/`WHERE` supply it themselves.
+pub(crate) fn push_path_prefix_filter(buf: &mut String, alias: &str, prefix: &str) {
+    let exact = prefix.trim_end_matches('/');
+    buf.push('(');
+    buf.push_str(alias);
+    buf.push_str("file_path = ");
+    push_quoted(buf, exact);
+    buf.push_str(" OR ");
+    buf.push_str(alias);
+    buf.push_str("file_path LIKE ");
+    push_quoted(buf, &format!("{}/%", escape_like(exact)));
+    buf.push_str(" ESCAPE '\\')");
 }
 
 /// Appends a SQL-safe quoted string or NULL for Option<String>.
@@ -290,7 +330,7 @@ pub(crate) fn display_language_for_path(path: &str) -> &'static str {
         "cs" => "C#",
         "fs" | "fsi" | "fsx" => "F#",
         "fst" | "fsti" => "F*",
-        "rb" => "Ruby",
+        "rb" | "rake" | "erb" | "slim" => "Ruby",
         "php" => "PHP",
         "dart" => "Dart",
         "lua" => "Lua",
@@ -318,8 +358,10 @@ pub(crate) fn display_language_for_path(path: &str) -> &'static str {
         "bas" => "BASIC",
         "bat" | "cmd" => "Batch",
         "glsl" | "vert" | "frag" | "comp" | "geom" | "tesc" | "tese" => "GLSL",
+        "v" | "vh" | "sv" | "svh" => "SystemVerilog",
         "qnt" => "Quint",
         "gd" => "GDScript",
+        "vhd" | "vhdl" => "VHDL",
         _ => "Other",
     }
 }
@@ -411,6 +453,10 @@ mod tests {
         assert_eq!(display_language_for_path("foo.fst"), "F*");
         assert_eq!(display_language_for_path("foo.fsti"), "F*");
         assert_eq!(display_language_for_path("foo.cpp"), "C++");
+        assert_eq!(display_language_for_path("rtl/top.v"), "SystemVerilog");
+        assert_eq!(display_language_for_path("rtl/defs.vh"), "SystemVerilog");
+        assert_eq!(display_language_for_path("rtl/top.sv"), "SystemVerilog");
+        assert_eq!(display_language_for_path("rtl/pkg.svh"), "SystemVerilog");
         assert_eq!(
             display_language_for_path("com/example/Game.as"),
             "ActionScript"
